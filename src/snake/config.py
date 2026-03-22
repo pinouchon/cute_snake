@@ -88,6 +88,8 @@ def normalize_config(config: dict[str, Any]) -> dict[str, Any]:
         "graph_disable_grad_clip": bool(
             config.get("graph_disable_grad_clip", runtime.get("graph_disable_grad_clip", False))
         ),
+        "startup_prewarm": bool(config.get("startup_prewarm", runtime.get("startup_prewarm", True))),
+        "startup_limit_seconds": float(config.get("startup_limit_seconds", runtime.get("startup_limit_seconds", 20.0))),
         "matmul_precision": str(config.get("matmul_precision", runtime.get("matmul_precision", "high"))),
         "allow_tf32": bool(config.get("allow_tf32", runtime.get("allow_tf32", False))),
         "cudnn_benchmark": bool(config.get("cudnn_benchmark", runtime.get("cudnn_benchmark", False))),

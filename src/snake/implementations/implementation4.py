@@ -84,6 +84,25 @@ def _maybe_compile_gae(config: dict[str, Any]):
     return torch.compile(_compute_gae_into, mode=str(config.get("compile_mode", "reduce-overhead")))
 
 
+def _prewarm_compile_path(
+    *,
+    model: SnakePolicy,
+    gae_pack: "_StaticGAEPack",
+    obs: torch.Tensor,
+    device: torch.device,
+    autocast_enabled: bool,
+    amp_dtype: torch.dtype,
+) -> float:
+    start = time.perf_counter()
+    with torch.no_grad():
+        with torch.autocast(device_type=device.type, enabled=autocast_enabled, dtype=amp_dtype):
+            _, next_values = model(obs)
+    gae_pack.run(next_value=next_values.to(torch.float32))
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    return time.perf_counter() - start
+
+
 def _sample_masked_actions(
     logits: torch.Tensor,
     mask: torch.Tensor,
@@ -483,6 +502,11 @@ def train(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> dict
     flat_logprobs = logprobs_buf.view(batch_size)
     flat_values = values_buf.view(batch_size)
     flat_masks = masks_buf.view(batch_size, 4)
+    index_bank = torch.empty(
+        (int(config["update_epochs"]), minibatches, minibatch_size),
+        dtype=torch.long,
+        device=device,
+    )
 
     policy_loss_tensor = torch.zeros((), dtype=torch.float32, device=device)
     value_loss_tensor = torch.zeros((), dtype=torch.float32, device=device)
@@ -507,6 +531,21 @@ def train(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> dict
         amp_dtype=amp_dtype,
         autocast_enabled=autocast_enabled,
     )
+    startup_seconds = 0.0
+    if bool(config.get("startup_prewarm", True)):
+        startup_seconds = _prewarm_compile_path(
+            model=model,
+            gae_pack=gae_pack,
+            obs=obs,
+            device=device,
+            autocast_enabled=autocast_enabled,
+            amp_dtype=amp_dtype,
+        )
+        startup_limit_seconds = float(config.get("startup_limit_seconds", 20.0))
+        if startup_seconds > startup_limit_seconds:
+            raise RuntimeError(
+                f"startup prewarm exceeded limit: {startup_seconds:.3f}s > {startup_limit_seconds:.3f}s"
+            )
 
     for update in range(1, int(config["total_updates"]) + 1):
         update_start = time.perf_counter()
@@ -515,6 +554,7 @@ def train(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> dict
         )
         rollout_seconds = 0.0
         gae_seconds = 0.0
+        shuffle_seconds = 0.0
         optimize_seconds = 0.0
         eval_seconds = 0.0
         checkpoint_seconds = 0.0
@@ -568,15 +608,13 @@ def train(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> dict
 
         if profile_update:
             optimize_start = _sync_perf_counter(device)
-        index_bank = torch.empty(
-            (int(config["update_epochs"]), minibatches, minibatch_size),
-            dtype=torch.long,
-            device=device,
-        )
+            shuffle_start = optimize_start
         for epoch in range(int(config["update_epochs"])):
             index_bank[epoch].copy_(
                 torch.randperm(batch_size, device=device, generator=shuffle_generator).view(minibatches, minibatch_size)
             )
+        if profile_update:
+            shuffle_seconds = _sync_perf_counter(device) - shuffle_start
         for epoch in range(int(config["update_epochs"])):
             for minibatch in range(minibatches):
                 learner.load_minibatch(
@@ -649,8 +687,11 @@ def train(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> dict
             if profile_update:
                 metrics["rollout_seconds"] = rollout_seconds
                 metrics["gae_seconds"] = gae_seconds
+                metrics["shuffle_seconds"] = shuffle_seconds
                 metrics["optimize_seconds"] = optimize_seconds
                 metrics["learner_samples_per_second"] = (int(config["update_epochs"]) * batch_size) / max(optimize_seconds, 1e-6)
+            if startup_seconds > 0.0:
+                metrics["startup_seconds"] = startup_seconds
             if learner.captured:
                 metrics["graph_capture_update"] = learner.capture_update
             if learner.graph_failed and learner.graph_error is not None:

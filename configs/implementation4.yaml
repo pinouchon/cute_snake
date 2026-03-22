@@ -1,13 +1,13 @@
 project: cute-snake
 implementation: implementation4
-seed: 94
+seed: 92
 device: cuda
 run_root: runs
 eval_episodes: 5
-eval_interval: 10
-eval_after_update: 90
+eval_interval: 50
+eval_after_update: 100
 eval_interval_after: 1
-eval_recent_coverage_gate: 0.65
+eval_recent_coverage_gate: 0.74
 checkpoint_interval: 1000
 success_target: 0.80
 stop_on_success: true
@@ -56,6 +56,8 @@ runtime:
   graph_learner: true
   graph_warmup_updates: 2
   graph_disable_grad_clip: true
+  startup_prewarm: true
+  startup_limit_seconds: 20.0
 
 logging:
   metrics_file: metrics.jsonl
