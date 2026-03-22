@@ -127,6 +127,7 @@ class _MinibatchWorkspace:
         self.obs = torch.empty((minibatch_size, board_size, board_size), dtype=torch.uint8, device=device)
         self.actions = torch.empty(minibatch_size, dtype=torch.long, device=device)
         self.old_logprobs = torch.empty(minibatch_size, dtype=torch.float32, device=device)
+        self.raw_advantages = torch.empty(minibatch_size, dtype=torch.float32, device=device)
         self.advantages = torch.empty(minibatch_size, dtype=torch.float32, device=device)
         self.returns = torch.empty(minibatch_size, dtype=torch.float32, device=device)
         self.old_values = torch.empty(minibatch_size, dtype=torch.float32, device=device)
@@ -139,6 +140,7 @@ class _MinibatchWorkspace:
         obs: torch.Tensor,
         actions: torch.Tensor,
         old_logprobs: torch.Tensor,
+        raw_advantages: torch.Tensor,
         advantages: torch.Tensor,
         returns: torch.Tensor,
         old_values: torch.Tensor,
@@ -147,6 +149,7 @@ class _MinibatchWorkspace:
         _index_select_into(self.obs, obs, indices)
         _index_select_into(self.actions, actions, indices)
         _index_select_into(self.old_logprobs, old_logprobs, indices)
+        _index_select_into(self.raw_advantages, raw_advantages, indices)
         _index_select_into(self.advantages, advantages, indices)
         _index_select_into(self.returns, returns, indices)
         _index_select_into(self.old_values, old_values, indices)
@@ -172,11 +175,12 @@ class _StaticGAEPack:
         self.run_fn = _maybe_compile_gae(config)
         self.advantages = torch.empty_like(rewards)
         self.returns = torch.empty_like(rewards)
+        self.flat_raw_advantages = torch.empty(batch_size, dtype=torch.float32, device=device)
         self.flat_advantages = torch.empty(batch_size, dtype=torch.float32, device=device)
         self.flat_returns = torch.empty(batch_size, dtype=torch.float32, device=device)
         self.next_value = torch.empty(rewards.shape[1], dtype=torch.float32, device=device)
 
-    def run(self, *, next_value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def run(self, *, next_value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         self.next_value.copy_(next_value)
         self.run_fn(
             advantages=self.advantages,
@@ -188,11 +192,37 @@ class _StaticGAEPack:
             gamma=self.gamma,
             gae_lambda=self.gae_lambda,
         )
+        self.flat_raw_advantages.copy_(self.advantages.reshape(-1))
         self.flat_advantages.copy_(self.advantages.reshape(-1))
         self.flat_advantages.sub_(self.flat_advantages.mean())
         self.flat_advantages.div_(self.flat_advantages.std().clamp(min=1e-6))
         self.flat_returns.copy_(self.returns.reshape(-1))
-        return self.flat_advantages, self.flat_returns
+        return self.flat_raw_advantages, self.flat_advantages, self.flat_returns
+
+
+def _dg_gate(
+    *,
+    new_logprobs: torch.Tensor,
+    raw_advantages: torch.Tensor,
+    advantages: torch.Tensor,
+    config: dict[str, Any],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    surprisal = (-new_logprobs).detach()
+    gate_advantages = raw_advantages if bool(config.get("dg_use_raw_advantage_for_gate", True)) else advantages
+    delight = gate_advantages.detach() * surprisal
+    gate = torch.sigmoid(delight / max(float(config.get("dg_eta", 1.0)), 1e-6))
+    gate_floor = float(config.get("dg_gate_floor", 0.0))
+    if gate_floor > 0.0:
+        gate = gate.clamp(min=gate_floor)
+    if bool(config.get("dg_detach_gate", True)):
+        gate = gate.detach()
+    return gate * advantages, {
+        "dg_gate_mean": gate.mean().detach().to(torch.float32),
+        "dg_delight_mean": delight.mean().detach().to(torch.float32),
+        "dg_surprisal_mean": surprisal.mean().detach().to(torch.float32),
+        "dg_gate_lt_0_1": (gate < 0.1).to(torch.float32).mean().detach(),
+        "dg_gate_gt_0_9": (gate > 0.9).to(torch.float32).mean().detach(),
+    }
 
 
 def _update_episode_stats(
@@ -260,6 +290,7 @@ def _ppo_loss(
     obs: torch.Tensor,
     actions: torch.Tensor,
     old_logprobs: torch.Tensor,
+    raw_advantages: torch.Tensor,
     advantages: torch.Tensor,
     returns: torch.Tensor,
     old_values: torch.Tensor,
@@ -268,15 +299,24 @@ def _ppo_loss(
     device: torch.device,
     autocast_enabled: bool,
     amp_dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     with torch.autocast(device_type=device.type, enabled=autocast_enabled, dtype=amp_dtype):
         logits, new_values = model(obs)
         dist = _masked_dist(logits, masks)
         new_logprobs = dist.log_prob(actions)
         entropy = dist.entropy().mean()
         ratios = (new_logprobs - old_logprobs).exp()
-        unclipped = ratios * advantages
-        clipped = torch.clamp(ratios, 1.0 - float(config["clip_coef"]), 1.0 + float(config["clip_coef"])) * advantages
+        policy_advantages = advantages
+        dg_stats: dict[str, torch.Tensor] = {}
+        if bool(config.get("dg_enabled", False)):
+            policy_advantages, dg_stats = _dg_gate(
+                new_logprobs=new_logprobs,
+                raw_advantages=raw_advantages,
+                advantages=advantages,
+                config=config,
+            )
+        unclipped = ratios * policy_advantages
+        clipped = torch.clamp(ratios, 1.0 - float(config["clip_coef"]), 1.0 + float(config["clip_coef"])) * policy_advantages
         policy_loss = -torch.min(unclipped, clipped).mean()
         new_values = new_values.to(torch.float32)
         if bool(config.get("use_value_clipping", True)):
@@ -292,7 +332,7 @@ def _ppo_loss(
         else:
             value_loss = 0.5 * (new_values - returns).pow(2).mean()
         loss = policy_loss + float(config["value_coef"]) * value_loss - float(config["entropy_coef"]) * entropy
-    return loss, policy_loss, value_loss, entropy
+    return loss, policy_loss, value_loss, entropy, dg_stats
 
 
 class _StaticLearner:
@@ -323,6 +363,11 @@ class _StaticLearner:
         self.policy_loss_tensor = torch.zeros((), dtype=torch.float32, device=device)
         self.value_loss_tensor = torch.zeros((), dtype=torch.float32, device=device)
         self.entropy_tensor = torch.zeros((), dtype=torch.float32, device=device)
+        self.dg_gate_mean_tensor = torch.zeros((), dtype=torch.float32, device=device)
+        self.dg_delight_mean_tensor = torch.zeros((), dtype=torch.float32, device=device)
+        self.dg_surprisal_mean_tensor = torch.zeros((), dtype=torch.float32, device=device)
+        self.dg_gate_lt_0_1_tensor = torch.zeros((), dtype=torch.float32, device=device)
+        self.dg_gate_gt_0_9_tensor = torch.zeros((), dtype=torch.float32, device=device)
         self.graph_enabled = bool(config.get("graph_learner", False)) and device.type == "cuda"
         self.graph_warmup_updates = int(config.get("graph_warmup_updates", 3))
         self.graph_failed = False
@@ -338,6 +383,7 @@ class _StaticLearner:
         obs: torch.Tensor,
         actions: torch.Tensor,
         old_logprobs: torch.Tensor,
+        raw_advantages: torch.Tensor,
         advantages: torch.Tensor,
         returns: torch.Tensor,
         old_values: torch.Tensor,
@@ -348,6 +394,7 @@ class _StaticLearner:
             obs=obs,
             actions=actions,
             old_logprobs=old_logprobs,
+            raw_advantages=raw_advantages,
             advantages=advantages,
             returns=returns,
             old_values=old_values,
@@ -355,11 +402,12 @@ class _StaticLearner:
         )
 
     def _step_once(self) -> None:
-        loss, policy_loss, value_loss, entropy = _ppo_loss(
+        loss, policy_loss, value_loss, entropy, dg_stats = _ppo_loss(
             model=self.model,
             obs=self.workspace.obs,
             actions=self.workspace.actions,
             old_logprobs=self.workspace.old_logprobs,
+            raw_advantages=self.workspace.raw_advantages,
             advantages=self.workspace.advantages,
             returns=self.workspace.returns,
             old_values=self.workspace.old_values,
@@ -377,6 +425,11 @@ class _StaticLearner:
         self.policy_loss_tensor.copy_(policy_loss.detach().to(torch.float32))
         self.value_loss_tensor.copy_(value_loss.detach().to(torch.float32))
         self.entropy_tensor.copy_(entropy.detach().to(torch.float32))
+        self.dg_gate_mean_tensor.copy_(dg_stats.get("dg_gate_mean", torch.zeros_like(self.dg_gate_mean_tensor)))
+        self.dg_delight_mean_tensor.copy_(dg_stats.get("dg_delight_mean", torch.zeros_like(self.dg_delight_mean_tensor)))
+        self.dg_surprisal_mean_tensor.copy_(dg_stats.get("dg_surprisal_mean", torch.zeros_like(self.dg_surprisal_mean_tensor)))
+        self.dg_gate_lt_0_1_tensor.copy_(dg_stats.get("dg_gate_lt_0_1", torch.zeros_like(self.dg_gate_lt_0_1_tensor)))
+        self.dg_gate_gt_0_9_tensor.copy_(dg_stats.get("dg_gate_gt_0_9", torch.zeros_like(self.dg_gate_gt_0_9_tensor)))
 
     def maybe_capture(self, update: int) -> None:
         if not self.graph_enabled or self.graph_failed or self.captured or update < self.graph_warmup_updates:
@@ -394,12 +447,18 @@ class _StaticLearner:
             self.graph_error = repr(exc)
             self.graph = None
 
-    def run(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def run(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         if self.captured and self.graph is not None:
             self.graph.replay()
         else:
             self._step_once()
-        return self.policy_loss_tensor, self.value_loss_tensor, self.entropy_tensor
+        return self.policy_loss_tensor, self.value_loss_tensor, self.entropy_tensor, {
+            "dg_gate_mean": self.dg_gate_mean_tensor,
+            "dg_delight_mean": self.dg_delight_mean_tensor,
+            "dg_surprisal_mean": self.dg_surprisal_mean_tensor,
+            "dg_gate_lt_0_1": self.dg_gate_lt_0_1_tensor,
+            "dg_gate_gt_0_9": self.dg_gate_gt_0_9_tensor,
+        }
 
 
 def train(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> dict[str, Any]:
@@ -500,6 +559,7 @@ def train(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> dict
     flat_obs = obs_buf.view(batch_size, env.board_size, env.board_size)
     flat_actions = actions_buf.view(batch_size)
     flat_logprobs = logprobs_buf.view(batch_size)
+    flat_raw_advantages = advantages_buf.view(batch_size)
     flat_values = values_buf.view(batch_size)
     flat_masks = masks_buf.view(batch_size, 4)
     index_bank = torch.empty(
@@ -602,7 +662,7 @@ def train(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> dict
         with torch.no_grad():
             with torch.autocast(device_type=device.type, enabled=autocast_enabled, dtype=amp_dtype):
                 _, next_values = model(obs)
-        flat_advantages, flat_returns = gae_pack.run(next_value=next_values.to(torch.float32))
+        flat_raw_advantages, flat_advantages, flat_returns = gae_pack.run(next_value=next_values.to(torch.float32))
         if profile_update:
             gae_seconds = _sync_perf_counter(device) - gae_start
 
@@ -622,13 +682,14 @@ def train(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> dict
                     obs=flat_obs,
                     actions=flat_actions,
                     old_logprobs=flat_logprobs,
+                    raw_advantages=flat_raw_advantages,
                     advantages=flat_advantages,
                     returns=flat_returns,
                     old_values=flat_values,
                     masks=flat_masks,
                 )
                 learner.maybe_capture(update)
-                policy_loss_tensor, value_loss_tensor, entropy_tensor = learner.run()
+                policy_loss_tensor, value_loss_tensor, entropy_tensor, dg_stats_tensors = learner.run()
         if profile_update:
             optimize_seconds = _sync_perf_counter(device) - optimize_start
 
@@ -665,6 +726,11 @@ def train(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> dict
                     "mean_completed_final_coverage": episode_coverage_sum_t / episode_count_t.clamp(min=1),
                     "mean_completed_episode_return": episode_return_sum_t / episode_count_t.clamp(min=1),
                     "mean_completed_episode_length": episode_length_sum_t / episode_count_t.clamp(min=1),
+                    **(
+                        dg_stats_tensors
+                        if bool(config.get("dg_enabled", False)) and bool(config.get("dg_log_metrics", True))
+                        else {}
+                    ),
                 }
             )
             recent_coverage = host_stats["mean_recent_final_coverage"]
@@ -684,6 +750,12 @@ def train(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> dict
                 "mean_recent_episode_return": host_stats["mean_recent_episode_return"],
                 "mean_recent_episode_length": host_stats["mean_recent_episode_length"],
             }
+            if bool(config.get("dg_enabled", False)) and bool(config.get("dg_log_metrics", True)):
+                metrics["dg_gate_mean"] = host_stats["dg_gate_mean"]
+                metrics["dg_delight_mean"] = host_stats["dg_delight_mean"]
+                metrics["dg_surprisal_mean"] = host_stats["dg_surprisal_mean"]
+                metrics["dg_gate_lt_0_1"] = host_stats["dg_gate_lt_0_1"]
+                metrics["dg_gate_gt_0_9"] = host_stats["dg_gate_gt_0_9"]
             if profile_update:
                 metrics["rollout_seconds"] = rollout_seconds
                 metrics["gae_seconds"] = gae_seconds

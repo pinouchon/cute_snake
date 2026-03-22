@@ -5,9 +5,9 @@ device: cuda
 run_root: runs
 eval_episodes: 5
 eval_interval: 50
-eval_after_update: 100
+eval_after_update: 69
 eval_interval_after: 1
-eval_recent_coverage_gate: 0.74
+eval_recent_coverage_gate: 0.42
 checkpoint_interval: 1000
 success_target: 0.80
 stop_on_success: true
@@ -38,6 +38,12 @@ ppo:
   value_coef: 0.5
   entropy_coef: 0.005
   use_value_clipping: false
+  dg_enabled: true
+  dg_eta: 8.0
+  dg_use_raw_advantage_for_gate: false
+  dg_detach_gate: true
+  dg_gate_floor: 0.1
+  dg_log_metrics: true
   lr: 2.8e-3
   max_grad_norm: 0.35
   total_updates: 160

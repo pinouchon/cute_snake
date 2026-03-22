@@ -108,6 +108,14 @@ def normalize_config(config: dict[str, Any]) -> dict[str, Any]:
         "value_coef": float(config.get("value_coef", ppo.get("value_coef", 0.5))),
         "entropy_coef": float(config.get("entropy_coef", ppo.get("entropy_coef", 0.005))),
         "use_value_clipping": bool(config.get("use_value_clipping", ppo.get("use_value_clipping", False))),
+        "dg_enabled": bool(config.get("dg_enabled", ppo.get("dg_enabled", False))),
+        "dg_eta": float(config.get("dg_eta", ppo.get("dg_eta", 1.0))),
+        "dg_use_raw_advantage_for_gate": bool(
+            config.get("dg_use_raw_advantage_for_gate", ppo.get("dg_use_raw_advantage_for_gate", True))
+        ),
+        "dg_detach_gate": bool(config.get("dg_detach_gate", ppo.get("dg_detach_gate", True))),
+        "dg_gate_floor": float(config.get("dg_gate_floor", ppo.get("dg_gate_floor", 0.0))),
+        "dg_log_metrics": bool(config.get("dg_log_metrics", ppo.get("dg_log_metrics", True))),
         "learning_rate": float(config.get("learning_rate", ppo.get("lr", 2.8e-3))),
         "max_grad_norm": float(config.get("max_grad_norm", ppo.get("max_grad_norm", 0.35))),
         "total_updates": int(config.get("total_updates", ppo.get("total_updates", 160))),
