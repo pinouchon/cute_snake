@@ -8,9 +8,6 @@ setup:
 test:
     uv run pytest
 
-bench-env:
-    uv run python scripts/bench_env.py
-
 next-run-dir:
     @mkdir -p runs
     @last="$$(find runs -maxdepth 1 -mindepth 1 -type d -regex '.*/[0-9][0-9][0-9][0-9]' | sed 's#.*/##' | sort | tail -n 1)"; \
@@ -25,7 +22,7 @@ train RUN_DIR='':
       runs/*) ;; \
       [0-9][0-9][0-9][0-9]) run_dir="runs/$$run_dir" ;; \
     esac; \
-    uv run python scripts/train.py --config configs/base.yaml --run-dir "$$run_dir"
+    uv run python scripts/train.py --config configs/implementation4.yaml --run-dir "$$run_dir"
 
 eval RUN_DIR='':
     @run_dir="$${RUN_DIR:-$$(find runs -maxdepth 1 -mindepth 1 -type d -regex '.*/[0-9][0-9][0-9][0-9]' | sort | tail -n 1)}"; \
@@ -44,6 +41,3 @@ visualize RUN_DIR='':
       [0-9][0-9][0-9][0-9]) run_dir="runs/$$run_dir" ;; \
     esac; \
     uv run python scripts/visualize.py --run-dir "$$run_dir"
-
-sweep:
-    uv run python scripts/sweep.py --config configs/sweep_wallclock.yaml

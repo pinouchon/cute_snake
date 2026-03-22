@@ -5,23 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cute-snake"
 version = "0.1.0"
-description = "GPU-first Snake PPO prototype with CuTe DSL and uv-based workflow management."
+description = "GPU-first Snake PPO prototype with a minimal uv-based workflow."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-  "numpy>=1.26",
   "torch>=2.5",
-  "matplotlib>=3.8",
   "pyyaml>=6.0",
-  "tqdm>=4.66",
-  "imageio>=2.34",
 ]
 
 [project.optional-dependencies]
-cute = [
-  "nvidia-cutlass-dsl[cu13]>=4.4",
-  "apache-tvm-ffi>=0.1",
-]
 dev = [
   "pytest>=8.3",
   "ruff>=0.6",

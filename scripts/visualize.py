@@ -7,9 +7,10 @@ import time
 
 import torch
 
-from snake.api import load_policy_from_checkpoint
 from snake.config import load_yaml_config
 from snake.env_reference import ReferenceSnakeEnv
+from snake.implementations.implementation4 import build_policy
+from snake.model import load_policy_state
 
 
 CELL_GLYPHS = {
@@ -44,10 +45,7 @@ def resolve_checkpoint_path(run_dir: Path, checkpoint_name: str) -> Path:
 
 def render_frame(obs: torch.Tensor) -> str:
     board = obs.cpu().tolist()
-    rows = []
-    for row in board:
-        rows.append("".join(CELL_GLYPHS[int(cell)] for cell in row))
-    return "\n".join(rows)
+    return "\n".join("".join(CELL_GLYPHS[int(cell)] for cell in row) for row in board)
 
 
 def main() -> None:
@@ -57,7 +55,9 @@ def main() -> None:
     checkpoint = torch.load(resolve_checkpoint_path(run_dir, args.checkpoint), map_location="cpu")
 
     device = torch.device(config["device"] if torch.cuda.is_available() else "cpu")
-    model = load_policy_from_checkpoint(config, checkpoint, device)
+    model = build_policy(config)
+    load_policy_state(model, checkpoint["model"])
+    model.to(device)
     model.eval()
 
     env = ReferenceSnakeEnv(

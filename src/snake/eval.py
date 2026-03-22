@@ -15,7 +15,6 @@ def evaluate_policy(
     episodes: int,
     seed: int,
     device: torch.device,
-    use_cute_step_core: bool = False,
 ) -> dict[str, Any]:
     model.eval()
     env = TorchSnakeBatchEnv(
@@ -28,7 +27,6 @@ def evaluate_policy(
         reward_food=1.0,
         reward_death=-1.0,
         reward_step=-0.01,
-        use_cute_step_core=use_cute_step_core,
     )
     obs = env.reset()
     finished = torch.zeros(episodes, dtype=torch.bool, device=device)

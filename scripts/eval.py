@@ -6,9 +6,10 @@ from pathlib import Path
 
 import torch
 
-from snake.api import load_policy_from_checkpoint
 from snake.config import load_yaml_config
 from snake.eval import evaluate_policy
+from snake.implementations.implementation4 import build_policy
+from snake.model import load_policy_state
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,7 +38,9 @@ def main() -> None:
     checkpoint = torch.load(resolve_checkpoint_path(run_dir, args.checkpoint), map_location="cpu")
 
     device = torch.device(config["device"] if torch.cuda.is_available() else "cpu")
-    model = load_policy_from_checkpoint(config, checkpoint, device)
+    model = build_policy(config)
+    load_policy_state(model, checkpoint["model"])
+    model.to(device)
 
     result = evaluate_policy(
         model,
@@ -46,7 +49,6 @@ def main() -> None:
         episodes=args.episodes or int(config["eval_episodes"]),
         seed=int(config["seed"]) + 10_000,
         device=device,
-        use_cute_step_core=bool(config.get("use_cute_step_core", False)),
     )
     print(json.dumps(result, indent=2))
 

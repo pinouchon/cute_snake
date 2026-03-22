@@ -1,6 +1,6 @@
 # Cute Snake
 
-Minimal scaffold for a GPU-first Snake PPO prototype using CuTe DSL, `uv`, and `just`.
+Minimal GPU-first Snake PPO training repo, trimmed to the current fastest working path.
 
 ## Target
 
@@ -31,7 +31,6 @@ just test
 just train
 just eval RUN_DIR=runs/0001
 just visualize RUN_DIR=runs/0001
-just sweep
 ```
 
 ## Run Layout
@@ -58,6 +57,18 @@ profiler/
 
 The `Justfile` includes a `next-run-dir` helper that creates the next directory and the standard subfolders.
 
+The default training config is [configs/implementation4.yaml](/home/vast/cute_snake/configs/implementation4.yaml).
+
+## Curated Runs
+
+The repo keeps a small archive of representative successful runs:
+
+- `runs/2325`: early fast compile/graph basin
+- `runs/2514`: fast no-compile basin
+- `runs/2683`: first sub-12s high-margin basin
+- `runs/2730`: round-10 sweep winner
+- `runs/2737`: current default validation winner
+
 ## Notes
 
-The actual training, evaluation, and visualization scripts are expected to live under `scripts/` and will consume the YAML configs in `configs/`. The packaging layer is intentionally minimal so the implementation can start small and stay GPU-focused.
+The supported code path is the `implementation4` CNN PPO trainer in `src/snake/implementations/implementation4.py`. Older implementation families and broad sweep tooling were removed to keep the tree small.

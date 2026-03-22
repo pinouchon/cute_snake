@@ -9,7 +9,6 @@ from typing import Any
 import torch
 from torch import nn
 
-from snake.cute_kernels import capability_summary
 from snake.env_gpu import TorchSnakeBatchEnv
 from snake.model import SnakePolicy, load_policy_state
 from snake.ppo import _compute_gae_into, _evaluate_policy_cached, _masked_dist, _sync_perf_counter
@@ -19,13 +18,14 @@ from snake.run_dirs import append_jsonl
 def build_policy(config: dict[str, Any]) -> SnakePolicy:
     return SnakePolicy(
         board_size=int(config["board_size"]),
-        trunk_channels=list(config.get("trunk_channels", [24, 48])),
+        trunk_channels=list(config.get("trunk_channels", [28, 56])),
         hidden_size=int(config["hidden_size"]),
-        model_type=str(config.get("model_type", "cnn")),
-        transformer_layers=int(config.get("transformer_layers", 4)),
-        transformer_heads=int(config.get("transformer_heads", 8)),
         channels_last=bool(config.get("channels_last", False)),
     )
+
+
+def load_checkpoint_into_policy(model: SnakePolicy, state_dict: dict[str, Any]) -> None:
+    load_policy_state(model, state_dict)
 
 
 def _should_eval(
@@ -65,13 +65,12 @@ def _is_eval_scheduled(
 def _maybe_compile_model(model: SnakePolicy, config: dict[str, Any]) -> SnakePolicy:
     if not bool(config.get("compile_model", False)) or not hasattr(torch, "compile"):
         return model
-    compile_mode = str(config.get("compile_mode", "reduce-overhead"))
     options: dict[str, Any] | None = None
     if bool(config.get("compile_disable_cudagraphs", False)):
         options = {"triton.cudagraphs": False}
     if options is not None:
         return torch.compile(model, options=options)  # type: ignore[return-value]
-    return torch.compile(model, mode=compile_mode)  # type: ignore[return-value]
+    return torch.compile(model, mode=str(config.get("compile_mode", "reduce-overhead")))  # type: ignore[return-value]
 
 
 def _maybe_compile_gae(config: dict[str, Any]):
@@ -105,13 +104,7 @@ def _index_select_into(dst: torch.Tensor, src: torch.Tensor, indices: torch.Tens
 
 
 class _MinibatchWorkspace:
-    def __init__(
-        self,
-        *,
-        device: torch.device,
-        board_size: int,
-        minibatch_size: int,
-    ) -> None:
+    def __init__(self, *, device: torch.device, board_size: int, minibatch_size: int) -> None:
         self.obs = torch.empty((minibatch_size, board_size, board_size), dtype=torch.uint8, device=device)
         self.actions = torch.empty(minibatch_size, dtype=torch.long, device=device)
         self.old_logprobs = torch.empty(minibatch_size, dtype=torch.float32, device=device)
@@ -141,76 +134,31 @@ class _MinibatchWorkspace:
         _index_select_into(self.masks, masks, indices)
 
 
-class _PermutationBank:
-    def __init__(
-        self,
-        *,
-        batch_size: int,
-        minibatches: int,
-        minibatch_size: int,
-        update_epochs: int,
-        bank_size: int,
-        device: torch.device,
-        generator: torch.Generator | None,
-    ) -> None:
-        self.batch_size = batch_size
-        self.bank_size = max(1, bank_size)
-        self.device = device
-        self.generator = generator
-        self.index_bank = torch.empty(
-            (self.bank_size, update_epochs, minibatches, minibatch_size),
-            dtype=torch.long,
-            device=device,
-        )
-        self.cursor = 0
-        self._fill()
-
-    def _fill(self) -> None:
-        for bank_index in range(self.index_bank.shape[0]):
-            for epoch in range(self.index_bank.shape[1]):
-                epoch_indices = torch.randperm(self.batch_size, device=self.device, generator=self.generator)
-                self.index_bank[bank_index, epoch].copy_(
-                    epoch_indices.view(self.index_bank.shape[2], self.index_bank.shape[3])
-                )
-
-    def next(self) -> torch.Tensor:
-        current = self.index_bank[self.cursor]
-        self.cursor = (self.cursor + 1) % self.bank_size
-        return current
-
-
 class _StaticGAEPack:
     def __init__(
         self,
         *,
         config: dict[str, Any],
-        device: torch.device,
         rewards: torch.Tensor,
         dones: torch.Tensor,
         values: torch.Tensor,
         batch_size: int,
+        device: torch.device,
     ) -> None:
-        self.device = device
         self.rewards = rewards
         self.dones = dones
         self.values = values
         self.gamma = float(config["gamma"])
         self.gae_lambda = float(config["gae_lambda"])
         self.run_fn = _maybe_compile_gae(config)
-        self.graph_enabled = bool(config.get("graph_gae_pack", False)) and device.type == "cuda"
-        self.graph_warmup_updates = int(config.get("graph_warmup_updates", 3))
-        self.graph_failed = False
-        self.graph_error: str | None = None
-        self.captured = False
-        self.capture_update = 0
-        self.graph: torch.cuda.CUDAGraph | None = None
         self.advantages = torch.empty_like(rewards)
         self.returns = torch.empty_like(rewards)
         self.flat_advantages = torch.empty(batch_size, dtype=torch.float32, device=device)
         self.flat_returns = torch.empty(batch_size, dtype=torch.float32, device=device)
         self.next_value = torch.empty(rewards.shape[1], dtype=torch.float32, device=device)
 
-    def _run_once(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def run(self, *, next_value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        self.next_value.copy_(next_value)
         self.run_fn(
             advantages=self.advantages,
             returns=self.returns,
@@ -226,29 +174,6 @@ class _StaticGAEPack:
         self.flat_advantages.div_(self.flat_advantages.std().clamp(min=1e-6))
         self.flat_returns.copy_(self.returns.reshape(-1))
         return self.flat_advantages, self.flat_returns
-
-    def maybe_capture(self, update: int) -> None:
-        if not self.graph_enabled or self.graph_failed or self.captured or update < self.graph_warmup_updates:
-            return
-        try:
-            self._run_once()
-            torch.cuda.synchronize(self.device)
-            self.graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.graph):
-                self._run_once()
-            self.captured = True
-            self.capture_update = update
-        except Exception as exc:
-            self.graph_failed = True
-            self.graph_error = repr(exc)
-            self.graph = None
-
-    def run(self, *, next_value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        self.next_value.copy_(next_value)
-        if self.captured and self.graph is not None:
-            self.graph.replay()
-            return self.flat_advantages, self.flat_returns
-        return self._run_once()
 
 
 def _update_episode_stats(
@@ -332,29 +257,22 @@ def _ppo_loss(
         entropy = dist.entropy().mean()
         ratios = (new_logprobs - old_logprobs).exp()
         unclipped = ratios * advantages
-        clipped = torch.clamp(
-            ratios,
-            1.0 - float(config["clip_coef"]),
-            1.0 + float(config["clip_coef"]),
-        ) * advantages
+        clipped = torch.clamp(ratios, 1.0 - float(config["clip_coef"]), 1.0 + float(config["clip_coef"])) * advantages
         policy_loss = -torch.min(unclipped, clipped).mean()
         new_values = new_values.to(torch.float32)
-        value_loss_unclipped = (new_values - returns).pow(2)
         if bool(config.get("use_value_clipping", True)):
             value_delta = new_values - old_values
             clipped_values = old_values + value_delta.clamp(
                 -float(config["clip_coef"]),
                 float(config["clip_coef"]),
             )
-            value_loss_clipped = (clipped_values - returns).pow(2)
-            value_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
+            value_loss = 0.5 * torch.max(
+                (new_values - returns).pow(2),
+                (clipped_values - returns).pow(2),
+            ).mean()
         else:
-            value_loss = 0.5 * value_loss_unclipped.mean()
-        loss = (
-            policy_loss
-            + float(config["value_coef"]) * value_loss
-            - float(config["entropy_coef"]) * entropy
-        )
+            value_loss = 0.5 * (new_values - returns).pow(2).mean()
+        loss = policy_loss + float(config["value_coef"]) * value_loss - float(config["entropy_coef"]) * entropy
     return loss, policy_loss, value_loss, entropy
 
 
@@ -375,7 +293,6 @@ class _StaticLearner:
         self.optimizer = optimizer
         self.config = config
         self.device = device
-        self.minibatch_size = minibatch_size
         self.amp_dtype = amp_dtype
         self.autocast_enabled = autocast_enabled
         self.disable_grad_clip = bool(config.get("graph_disable_grad_clip", False))
@@ -388,25 +305,12 @@ class _StaticLearner:
         self.value_loss_tensor = torch.zeros((), dtype=torch.float32, device=device)
         self.entropy_tensor = torch.zeros((), dtype=torch.float32, device=device)
         self.graph_enabled = bool(config.get("graph_learner", False)) and device.type == "cuda"
-        self.graph_whole_learner = self.graph_enabled and bool(config.get("graph_whole_learner", False))
         self.graph_warmup_updates = int(config.get("graph_warmup_updates", 3))
         self.graph_failed = False
         self.graph_error: str | None = None
         self.graph: torch.cuda.CUDAGraph | None = None
         self.captured = False
         self.capture_update = 0
-        self.batch_obs: torch.Tensor | None = None
-        self.batch_actions: torch.Tensor | None = None
-        self.batch_old_logprobs: torch.Tensor | None = None
-        self.batch_advantages: torch.Tensor | None = None
-        self.batch_returns: torch.Tensor | None = None
-        self.batch_old_values: torch.Tensor | None = None
-        self.batch_masks: torch.Tensor | None = None
-        self.index_bank: torch.Tensor | None = None
-        if self.graph_whole_learner:
-            update_epochs = int(config["update_epochs"])
-            minibatches = int(config["minibatches"])
-            self.index_bank = torch.empty((update_epochs, minibatches, minibatch_size), dtype=torch.long, device=device)
 
     def load_minibatch(
         self,
@@ -430,29 +334,6 @@ class _StaticLearner:
             old_values=old_values,
             masks=masks,
         )
-
-    def set_whole_batch(
-        self,
-        *,
-        obs: torch.Tensor,
-        actions: torch.Tensor,
-        old_logprobs: torch.Tensor,
-        advantages: torch.Tensor,
-        returns: torch.Tensor,
-        old_values: torch.Tensor,
-        masks: torch.Tensor,
-    ) -> None:
-        self.batch_obs = obs
-        self.batch_actions = actions
-        self.batch_old_logprobs = old_logprobs
-        self.batch_advantages = advantages
-        self.batch_returns = returns
-        self.batch_old_values = old_values
-        self.batch_masks = masks
-
-    def load_index_bank(self, index_bank: torch.Tensor) -> None:
-        if self.index_bank is not None:
-            self.index_bank.copy_(index_bank)
 
     def _step_once(self) -> None:
         loss, policy_loss, value_loss, entropy = _ppo_loss(
@@ -478,44 +359,15 @@ class _StaticLearner:
         self.value_loss_tensor.copy_(value_loss.detach().to(torch.float32))
         self.entropy_tensor.copy_(entropy.detach().to(torch.float32))
 
-    def _step_whole_learner(self) -> None:
-        assert self.index_bank is not None
-        assert self.batch_obs is not None
-        assert self.batch_actions is not None
-        assert self.batch_old_logprobs is not None
-        assert self.batch_advantages is not None
-        assert self.batch_returns is not None
-        assert self.batch_old_values is not None
-        assert self.batch_masks is not None
-        for epoch in range(self.index_bank.shape[0]):
-            for minibatch in range(self.index_bank.shape[1]):
-                self.workspace.load(
-                    indices=self.index_bank[epoch, minibatch],
-                    obs=self.batch_obs,
-                    actions=self.batch_actions,
-                    old_logprobs=self.batch_old_logprobs,
-                    advantages=self.batch_advantages,
-                    returns=self.batch_returns,
-                    old_values=self.batch_old_values,
-                    masks=self.batch_masks,
-                )
-                self._step_once()
-
     def maybe_capture(self, update: int) -> None:
         if not self.graph_enabled or self.graph_failed or self.captured or update < self.graph_warmup_updates:
             return
         try:
-            if self.graph_whole_learner:
-                self._step_whole_learner()
-            else:
-                self._step_once()
+            self._step_once()
             torch.cuda.synchronize(self.device)
             self.graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self.graph):
-                if self.graph_whole_learner:
-                    self._step_whole_learner()
-                else:
-                    self._step_once()
+                self._step_once()
             self.captured = True
             self.capture_update = update
         except Exception as exc:
@@ -526,8 +378,6 @@ class _StaticLearner:
     def run(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.captured and self.graph is not None:
             self.graph.replay()
-        elif self.graph_whole_learner:
-            self._step_whole_learner()
         else:
             self._step_once()
         return self.policy_loss_tensor, self.value_loss_tensor, self.entropy_tensor
@@ -554,7 +404,6 @@ def train(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> dict
         reward_food=float(config["reward_food"]),
         reward_death=float(config["reward_death"]),
         reward_step=float(config["reward_step"]),
-        use_cute_step_core=bool(config.get("use_cute_step_core", False)),
     )
     obs = env.reset()
     eval_seed = int(config["seed"]) + 10_000
@@ -568,11 +417,10 @@ def train(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> dict
         reward_food=float(config["reward_food"]),
         reward_death=float(config["reward_death"]),
         reward_step=float(config["reward_step"]),
-        use_cute_step_core=bool(config.get("use_cute_step_core", False)),
     )
 
     model = build_policy(config).to(device)
-    if bool(config.get("channels_last", False)) and str(config.get("model_type", "cnn")) == "cnn":
+    if bool(config.get("channels_last", False)):
         model = model.to(memory_format=torch.channels_last)
     init_checkpoint = config.get("init_checkpoint")
     if init_checkpoint:
@@ -580,11 +428,10 @@ def train(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> dict
         load_policy_state(model, checkpoint["model"])
     model = _maybe_compile_model(model, config)
 
-    graph_learner_enabled = bool(config.get("graph_learner", False)) and device.type == "cuda"
     optimizer_kwargs: dict[str, Any] = {"lr": float(config["learning_rate"])}
     if device.type == "cuda":
         optimizer_kwargs["fused"] = True
-        if graph_learner_enabled:
+        if bool(config.get("graph_learner", False)):
             optimizer_kwargs["capturable"] = True
     optimizer = torch.optim.Adam(model.parameters(), **optimizer_kwargs)
 
@@ -608,13 +455,9 @@ def train(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> dict
     success_reached = False
     metrics_path = run_dir / str(config["metrics_file"])
     checkpoint_dir = run_dir / str(config["checkpoint_dir"])
-    scaler_enabled = (
-        bool(config.get("amp", False))
-        and device.type == "cuda"
-        and not (graph_learner_enabled and bool(config.get("graph_disable_grad_scaler", True)))
-    )
-    amp_dtype_name = str(config.get("amp_dtype", "float16")).lower()
-    amp_dtype = torch.float16 if amp_dtype_name == "float16" else torch.bfloat16
+    amp_dtype = torch.float16 if str(config.get("amp_dtype", "float16")).lower() == "float16" else torch.bfloat16
+    autocast_enabled = bool(config.get("amp", False)) and device.type == "cuda"
+
     rollout_generator: torch.Generator | None = None
     shuffle_generator: torch.Generator | None = None
     if device.type == "cuda":
@@ -634,36 +477,25 @@ def train(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> dict
     recent_decay = 0.9
     start_time = time.perf_counter()
     last_console_log = start_time
+
     flat_obs = obs_buf.view(batch_size, env.board_size, env.board_size)
     flat_actions = actions_buf.view(batch_size)
     flat_logprobs = logprobs_buf.view(batch_size)
-    flat_rewards = rewards_buf.view(batch_size)
-    flat_dones = dones_buf.view(batch_size)
     flat_values = values_buf.view(batch_size)
-    flat_advantages = advantages_buf.view(batch_size)
-    flat_returns = returns_buf.view(batch_size)
     flat_masks = masks_buf.view(batch_size, 4)
+
     policy_loss_tensor = torch.zeros((), dtype=torch.float32, device=device)
     value_loss_tensor = torch.zeros((), dtype=torch.float32, device=device)
     entropy_tensor = torch.zeros((), dtype=torch.float32, device=device)
-    static_minibatch_buffers = bool(config.get("static_minibatch_buffers", True))
     metrics_interval_updates = max(0, int(config.get("metrics_interval_updates", 1)))
+
     gae_pack = _StaticGAEPack(
         config=config,
-        device=device,
         rewards=rewards_buf,
         dones=dones_buf,
         values=values_buf,
         batch_size=batch_size,
-    )
-    permutation_bank = _PermutationBank(
-        batch_size=batch_size,
-        minibatches=minibatches,
-        minibatch_size=minibatch_size,
-        update_epochs=int(config["update_epochs"]),
-        bank_size=int(config.get("permutation_bank_size", 1)),
         device=device,
-        generator=shuffle_generator,
     )
     learner = _StaticLearner(
         model=model,
@@ -673,20 +505,8 @@ def train(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> dict
         board_size=env.board_size,
         minibatch_size=minibatch_size,
         amp_dtype=amp_dtype,
-        autocast_enabled=bool(config.get("amp", False)) and device.type == "cuda",
+        autocast_enabled=autocast_enabled,
     )
-    if learner.graph_whole_learner:
-        learner.set_whole_batch(
-            obs=flat_obs,
-            actions=flat_actions,
-            old_logprobs=flat_logprobs,
-            advantages=flat_advantages,
-            returns=flat_returns,
-            old_values=flat_values,
-            masks=flat_masks,
-        )
-
-    logger.info("CuTe capability: %s", capability_summary())
 
     for update in range(1, int(config["total_updates"]) + 1):
         update_start = time.perf_counter()
@@ -708,7 +528,7 @@ def train(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> dict
             masks_buf[step].copy_(mask)
 
             with torch.no_grad():
-                with torch.autocast(device_type=device.type, enabled=scaler_enabled, dtype=amp_dtype):
+                with torch.autocast(device_type=device.type, enabled=autocast_enabled, dtype=amp_dtype):
                     logits, values = model(obs)
                 actions, logprobs = _sample_masked_actions(logits, mask, generator=rollout_generator)
 
@@ -740,107 +560,37 @@ def train(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> dict
         if profile_update:
             gae_start = _sync_perf_counter(device)
         with torch.no_grad():
-            with torch.autocast(device_type=device.type, enabled=scaler_enabled, dtype=amp_dtype):
+            with torch.autocast(device_type=device.type, enabled=autocast_enabled, dtype=amp_dtype):
                 _, next_values = model(obs)
-
-        gae_pack.maybe_capture(update)
         flat_advantages, flat_returns = gae_pack.run(next_value=next_values.to(torch.float32))
         if profile_update:
             gae_seconds = _sync_perf_counter(device) - gae_start
 
-        b_obs = flat_obs
-        b_actions = flat_actions
-        b_logprobs = flat_logprobs
-        b_advantages = flat_advantages
-        b_returns = flat_returns
-        b_values = flat_values
-        b_masks = flat_masks
-
         if profile_update:
             optimize_start = _sync_perf_counter(device)
-        index_bank = permutation_bank.next()
-        if learner.graph_whole_learner:
-            learner.set_whole_batch(
-                obs=b_obs,
-                actions=b_actions,
-                old_logprobs=b_logprobs,
-                advantages=b_advantages,
-                returns=b_returns,
-                old_values=b_values,
-                masks=b_masks,
+        index_bank = torch.empty(
+            (int(config["update_epochs"]), minibatches, minibatch_size),
+            dtype=torch.long,
+            device=device,
+        )
+        for epoch in range(int(config["update_epochs"])):
+            index_bank[epoch].copy_(
+                torch.randperm(batch_size, device=device, generator=shuffle_generator).view(minibatches, minibatch_size)
             )
-            learner.load_index_bank(index_bank)
-            learner.maybe_capture(update)
-            policy_loss_tensor, value_loss_tensor, entropy_tensor = learner.run()
-        else:
-            for epoch in range(int(config["update_epochs"])):
-                for minibatch in range(minibatches):
-                    mb_indices = index_bank[epoch, minibatch]
-                    if static_minibatch_buffers:
-                        learner.load_minibatch(
-                            indices=mb_indices,
-                            obs=b_obs,
-                            actions=b_actions,
-                            old_logprobs=b_logprobs,
-                            advantages=b_advantages,
-                            returns=b_returns,
-                            old_values=b_values,
-                            masks=b_masks,
-                        )
-                        learner.maybe_capture(update)
-                        if learner.captured or learner.graph_failed or graph_learner_enabled:
-                            policy_loss_tensor, value_loss_tensor, entropy_tensor = learner.run()
-                        else:
-                            loss, policy_loss, value_loss, entropy = _ppo_loss(
-                                model=model,
-                                obs=learner.workspace.obs,
-                                actions=learner.workspace.actions,
-                                old_logprobs=learner.workspace.old_logprobs,
-                                advantages=learner.workspace.advantages,
-                                returns=learner.workspace.returns,
-                                old_values=learner.workspace.old_values,
-                                masks=learner.workspace.masks,
-                                config=config,
-                                device=device,
-                                autocast_enabled=scaler_enabled,
-                                amp_dtype=amp_dtype,
-                            )
-                            optimizer.zero_grad(set_to_none=True)
-                            loss.backward()
-                            nn.utils.clip_grad_norm_(model.parameters(), float(config["max_grad_norm"]))
-                            optimizer.step()
-                            policy_loss_tensor.copy_(policy_loss.detach().to(torch.float32))
-                            value_loss_tensor.copy_(value_loss.detach().to(torch.float32))
-                            entropy_tensor.copy_(entropy.detach().to(torch.float32))
-                    else:
-                        mb_obs = b_obs[mb_indices]
-                        mb_actions = b_actions[mb_indices]
-                        mb_old_logprobs = b_logprobs[mb_indices]
-                        mb_advantages = b_advantages[mb_indices]
-                        mb_returns = b_returns[mb_indices]
-                        mb_old_values = b_values[mb_indices]
-                        mb_masks = b_masks[mb_indices]
-                        loss, policy_loss, value_loss, entropy = _ppo_loss(
-                            model=model,
-                            obs=mb_obs,
-                            actions=mb_actions,
-                            old_logprobs=mb_old_logprobs,
-                            advantages=mb_advantages,
-                            returns=mb_returns,
-                            old_values=mb_old_values,
-                            masks=mb_masks,
-                            config=config,
-                            device=device,
-                            autocast_enabled=scaler_enabled,
-                            amp_dtype=amp_dtype,
-                        )
-                        optimizer.zero_grad(set_to_none=True)
-                        loss.backward()
-                        nn.utils.clip_grad_norm_(model.parameters(), float(config["max_grad_norm"]))
-                        optimizer.step()
-                        policy_loss_tensor.copy_(policy_loss.detach().to(torch.float32))
-                        value_loss_tensor.copy_(value_loss.detach().to(torch.float32))
-                        entropy_tensor.copy_(entropy.detach().to(torch.float32))
+        for epoch in range(int(config["update_epochs"])):
+            for minibatch in range(minibatches):
+                learner.load_minibatch(
+                    indices=index_bank[epoch, minibatch],
+                    obs=flat_obs,
+                    actions=flat_actions,
+                    old_logprobs=flat_logprobs,
+                    advantages=flat_advantages,
+                    returns=flat_returns,
+                    old_values=flat_values,
+                    masks=flat_masks,
+                )
+                learner.maybe_capture(update)
+                policy_loss_tensor, value_loss_tensor, entropy_tensor = learner.run()
         if profile_update:
             optimize_seconds = _sync_perf_counter(device) - optimize_start
 
@@ -900,17 +650,11 @@ def train(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> dict
                 metrics["rollout_seconds"] = rollout_seconds
                 metrics["gae_seconds"] = gae_seconds
                 metrics["optimize_seconds"] = optimize_seconds
-                metrics["learner_samples_per_second"] = (
-                    (int(config["update_epochs"]) * batch_size) / max(optimize_seconds, 1e-6)
-                )
+                metrics["learner_samples_per_second"] = (int(config["update_epochs"]) * batch_size) / max(optimize_seconds, 1e-6)
             if learner.captured:
                 metrics["graph_capture_update"] = learner.capture_update
             if learner.graph_failed and learner.graph_error is not None:
                 metrics["graph_error"] = learner.graph_error
-            if gae_pack.captured:
-                metrics["gae_graph_capture_update"] = gae_pack.capture_update
-            if gae_pack.graph_failed and gae_pack.graph_error is not None:
-                metrics["gae_graph_error"] = gae_pack.graph_error
 
         if scheduled_eval and _should_eval(
             update,
@@ -944,11 +688,12 @@ def train(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> dict
             if bool(config["stop_on_success"]) and evaluation["mean_final_coverage"] >= float(config["success_target"]):
                 success_reached = True
 
-        if profile_update and (bool(config["save_latest"]) or update % int(config["checkpoint_interval"]) == 0):
+        should_checkpoint = bool(config["save_latest"]) or update % int(config["checkpoint_interval"]) == 0
+        if profile_update and should_checkpoint:
             checkpoint_start = _sync_perf_counter(device)
-        if bool(config["save_latest"]) or update % int(config["checkpoint_interval"]) == 0:
+        if should_checkpoint:
             torch.save({"model": model.state_dict(), "config": config}, checkpoint_dir / "latest.pt")
-        if profile_update and (bool(config["save_latest"]) or update % int(config["checkpoint_interval"]) == 0):
+        if profile_update and should_checkpoint:
             checkpoint_seconds = _sync_perf_counter(device) - checkpoint_start
             if metrics is None:
                 metrics = {
@@ -961,11 +706,7 @@ def train(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> dict
 
         if metrics is not None:
             append_jsonl(metrics_path, metrics)
-        if metrics is not None and (
-            should_emit_console
-            or "eval_mean_final_coverage" in metrics
-            or update == int(config["total_updates"])
-        ):
+        if metrics is not None and (should_emit_console or "eval_mean_final_coverage" in metrics or update == int(config["total_updates"])):
             logger.info(
                 "update=%s env_steps=%s recent_cov=%.3f recent_return=%.3f eval_cov=%s sps=%.0f",
                 update,

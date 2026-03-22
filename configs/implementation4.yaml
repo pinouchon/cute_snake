@@ -15,15 +15,12 @@ stop_on_success: true
 env:
   board_size: 8
   initial_length: 3
-  food_count: 1
   starvation_steps: 128
-  use_cute_step_core: false
   reward_food: 1.0
   reward_death: -1.0
   reward_step: -0.01
 
 model:
-  type: cnn
   trunk_channels: [28, 56]
   hidden_dim: 224
   channels_last: true
@@ -57,12 +54,8 @@ runtime:
   matmul_precision: high
   compile_gae: true
   graph_learner: true
-  graph_whole_learner: false
-  graph_gae_pack: false
   graph_warmup_updates: 2
   graph_disable_grad_clip: true
-  permutation_bank_size: 1
-  static_minibatch_buffers: true
 
 logging:
   metrics_file: metrics.jsonl

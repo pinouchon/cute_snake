@@ -4,14 +4,14 @@ import argparse
 import logging
 from pathlib import Path
 
-from snake.api import train
 from snake.config import apply_overrides, load_yaml_config, normalize_config, save_yaml_config
+from snake.implementations.implementation4 import train
 from snake.run_dirs import allocate_run_dir
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/base.yaml")
+    parser.add_argument("--config", default="configs/implementation4.yaml")
     parser.add_argument("--run-dir", default=None)
     parser.add_argument("--set", dest="overrides", action="append", default=[])
     return parser.parse_args()
