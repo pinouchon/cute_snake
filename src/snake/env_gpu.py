@@ -5,6 +5,7 @@ from typing import Any
 
 import torch
 
+from snake.cute_fused_experiment import fused_step_update_cuda
 from snake.cute_kernels import HAVE_CUTE, step_core_cuda
 
 
@@ -51,11 +52,10 @@ class TorchSnakeBatchEnv:
             dtype=torch.long,
             device=self.device,
         )
-        self.initial_slots = torch.arange(self.initial_length, dtype=torch.long, device=self.device)
 
         self.board = torch.zeros((num_envs, self.num_cells), dtype=torch.uint8, device=self.device)
         self.occupancy = torch.zeros((num_envs, self.num_cells), dtype=torch.bool, device=self.device)
-        self.occupancy_i64 = torch.zeros((num_envs, self.num_cells), dtype=torch.int64, device=self.device)
+        self.occupancy_i64: torch.Tensor | None = None
         self.body = torch.zeros((num_envs, self.num_cells), dtype=torch.long, device=self.device)
         self.start = torch.zeros(num_envs, dtype=torch.long, device=self.device)
         self.length = torch.zeros(num_envs, dtype=torch.long, device=self.device)
@@ -66,19 +66,52 @@ class TorchSnakeBatchEnv:
         self.steps_since_food = torch.zeros(num_envs, dtype=torch.long, device=self.device)
         self.episode_return = torch.zeros(num_envs, dtype=torch.float32, device=self.device)
         self.reset_counts = torch.zeros(num_envs, dtype=torch.long, device=self.device)
+        self.step_old_start = torch.zeros(num_envs, dtype=torch.long, device=self.device)
+        self.step_old_length = torch.zeros(num_envs, dtype=torch.long, device=self.device)
+        self.step_rewards = torch.zeros(num_envs, dtype=torch.float32, device=self.device)
+        self.info_final_coverage = torch.zeros(num_envs, dtype=torch.float32, device=self.device)
         self.rngs = [random.Random(seed + idx * 100_000) for idx in range(num_envs)]
         self.cuda_generator: torch.Generator | None = None
         self.cute_step_enabled = bool(use_cute_step_core) and self.use_fast_cuda and HAVE_CUTE
-        self.cute_done = torch.empty(num_envs, dtype=torch.int64, device=self.device)
-        self.cute_actions = torch.empty(num_envs, dtype=torch.long, device=self.device)
-        self.cute_next_pos = torch.empty(num_envs, dtype=torch.long, device=self.device)
-        self.cute_wall = torch.empty(num_envs, dtype=torch.int64, device=self.device)
-        self.cute_growing = torch.empty(num_envs, dtype=torch.int64, device=self.device)
-        self.cute_dead = torch.empty(num_envs, dtype=torch.int64, device=self.device)
-        self.cute_moving = torch.empty(num_envs, dtype=torch.int64, device=self.device)
+        self.cute_done: torch.Tensor | None = None
+        self.cute_actions: torch.Tensor | None = None
+        self.cute_next_pos: torch.Tensor | None = None
+        self.cute_wall: torch.Tensor | None = None
+        self.cute_growing: torch.Tensor | None = None
+        self.cute_dead: torch.Tensor | None = None
+        self.cute_moving: torch.Tensor | None = None
+        self.cute_new_heading: torch.Tensor | None = None
+        self.cute_new_start: torch.Tensor | None = None
+        self.cute_new_length: torch.Tensor | None = None
+        self.cute_new_episode_step: torch.Tensor | None = None
+        self.cute_new_steps_since_food: torch.Tensor | None = None
+        self.cute_new_done: torch.Tensor | None = None
+        self.cute_new_episode_return: torch.Tensor | None = None
+        self.cute_reward: torch.Tensor | None = None
+        self.cute_won: torch.Tensor | None = None
+        self.cute_truncated: torch.Tensor | None = None
         if self.use_fast_cuda:
             self.cuda_generator = torch.Generator(device=self.device)
             self.cuda_generator.manual_seed(seed)
+        if self.cute_step_enabled:
+            self.occupancy_i64 = torch.zeros((num_envs, self.num_cells), dtype=torch.int64, device=self.device)
+            self.cute_done = torch.empty(num_envs, dtype=torch.int64, device=self.device)
+            self.cute_actions = torch.empty(num_envs, dtype=torch.long, device=self.device)
+            self.cute_next_pos = torch.empty(num_envs, dtype=torch.long, device=self.device)
+            self.cute_wall = torch.empty(num_envs, dtype=torch.int64, device=self.device)
+            self.cute_growing = torch.empty(num_envs, dtype=torch.int64, device=self.device)
+            self.cute_dead = torch.empty(num_envs, dtype=torch.int64, device=self.device)
+            self.cute_moving = torch.empty(num_envs, dtype=torch.int64, device=self.device)
+            self.cute_new_heading = torch.empty(num_envs, dtype=torch.int64, device=self.device)
+            self.cute_new_start = torch.empty(num_envs, dtype=torch.int64, device=self.device)
+            self.cute_new_length = torch.empty(num_envs, dtype=torch.int64, device=self.device)
+            self.cute_new_episode_step = torch.empty(num_envs, dtype=torch.int64, device=self.device)
+            self.cute_new_steps_since_food = torch.empty(num_envs, dtype=torch.int64, device=self.device)
+            self.cute_new_done = torch.empty(num_envs, dtype=torch.int64, device=self.device)
+            self.cute_new_episode_return = torch.empty(num_envs, dtype=torch.float32, device=self.device)
+            self.cute_reward = torch.empty(num_envs, dtype=torch.float32, device=self.device)
+            self.cute_won = torch.empty(num_envs, dtype=torch.int64, device=self.device)
+            self.cute_truncated = torch.empty(num_envs, dtype=torch.int64, device=self.device)
 
     def reset(self, mask: torch.Tensor | None = None) -> torch.Tensor:
         if self.use_fast_cuda:
@@ -95,7 +128,8 @@ class TorchSnakeBatchEnv:
 
             self.board[index].zero_()
             self.occupancy[index].zero_()
-            self.occupancy_i64[index].zero_()
+            if self.occupancy_i64 is not None:
+                self.occupancy_i64[index].zero_()
             self.body[index].zero_()
             self.start[index] = 0
             self.length[index] = self.initial_length
@@ -114,7 +148,8 @@ class TorchSnakeBatchEnv:
             )
             self.body[index, : self.initial_length] = snake
             self.occupancy[index, snake] = True
-            self.occupancy_i64[index, snake] = 1
+            if self.occupancy_i64 is not None:
+                self.occupancy_i64[index, snake] = 1
             self.board[index, snake[:-1]] = 2
             self.board[index, snake[-1]] = self.head_codes[1]
             self.food[index] = self._spawn_food(index)
@@ -132,7 +167,8 @@ class TorchSnakeBatchEnv:
         self.reset_counts[indices] += 1
         self.board[indices] = 0
         self.occupancy[indices] = False
-        self.occupancy_i64[indices] = 0
+        if self.occupancy_i64 is not None:
+            self.occupancy_i64[indices] = 0
         self.body[indices] = 0
         self.start[indices] = 0
         self.length[indices] = self.initial_length
@@ -146,7 +182,8 @@ class TorchSnakeBatchEnv:
         initial_cells = self.initial_snake.unsqueeze(0).expand(indices.numel(), -1)
         self.body[indices, : self.initial_length] = initial_cells
         self.occupancy[indices.unsqueeze(1), initial_cells] = True
-        self.occupancy_i64[indices.unsqueeze(1), initial_cells] = 1
+        if self.occupancy_i64 is not None:
+            self.occupancy_i64[indices.unsqueeze(1), initial_cells] = 1
         if self.initial_length > 1:
             self.board[indices.unsqueeze(1), initial_cells[:, :-1]] = 2
         self.board[indices, initial_cells[:, -1]] = self.head_codes[1]
@@ -192,17 +229,39 @@ class TorchSnakeBatchEnv:
         actions = torch.where(actions == reverse, self.heading, actions)
         actions = torch.where(active, actions, self.heading)
 
-        old_start = self.start.clone()
-        old_length = self.length.clone()
+        self.step_old_start.copy_(self.start)
+        self.step_old_length.copy_(self.length)
+        old_start = self.step_old_start
+        old_length = self.step_old_length
         head_slot = (old_start + old_length - 1) % self.num_cells
         tail_slot = old_start
         head_pos = self.body[self.env_indices, head_slot]
         tail_pos = self.body[self.env_indices, tail_slot]
 
+        won: torch.Tensor
+        truncated: torch.Tensor
         if self.cute_step_enabled:
             try:
+                assert self.cute_done is not None
+                assert self.cute_actions is not None
+                assert self.cute_next_pos is not None
+                assert self.cute_wall is not None
+                assert self.cute_growing is not None
+                assert self.cute_dead is not None
+                assert self.cute_moving is not None
+                assert self.cute_new_heading is not None
+                assert self.cute_new_start is not None
+                assert self.cute_new_length is not None
+                assert self.cute_new_episode_step is not None
+                assert self.cute_new_steps_since_food is not None
+                assert self.cute_new_done is not None
+                assert self.cute_new_episode_return is not None
+                assert self.cute_reward is not None
+                assert self.cute_won is not None
+                assert self.cute_truncated is not None
+                assert self.occupancy_i64 is not None
                 self.cute_done.copy_(self.done.to(torch.int64))
-                step_core_cuda(
+                fused_step_update_cuda(
                     actions=actions,
                     heading=self.heading,
                     head_pos=head_pos,
@@ -210,13 +269,32 @@ class TorchSnakeBatchEnv:
                     food=self.food,
                     done=self.cute_done,
                     occupancy=self.occupancy_i64,
+                    start=self.start,
+                    length=self.length,
+                    episode_step=self.episode_step,
+                    steps_since_food=self.steps_since_food,
+                    episode_return=self.episode_return,
                     board_size=self.board_size,
+                    max_steps_since_food=self.max_steps_since_food,
+                    reward_food=self.reward_food,
+                    reward_death=self.reward_death,
+                    reward_step=self.reward_step,
                     sanitized_actions=self.cute_actions,
                     next_pos=self.cute_next_pos,
                     wall=self.cute_wall,
                     growing=self.cute_growing,
                     dead=self.cute_dead,
                     moving=self.cute_moving,
+                    new_heading=self.cute_new_heading,
+                    new_start=self.cute_new_start,
+                    new_length=self.cute_new_length,
+                    new_episode_step=self.cute_new_episode_step,
+                    new_steps_since_food=self.cute_new_steps_since_food,
+                    new_done=self.cute_new_done,
+                    new_episode_return=self.cute_new_episode_return,
+                    reward=self.cute_reward,
+                    won=self.cute_won,
+                    truncated=self.cute_truncated,
                 )
                 actions = self.cute_actions
                 next_pos = self.cute_next_pos
@@ -224,6 +302,16 @@ class TorchSnakeBatchEnv:
                 growing = self.cute_growing.to(torch.bool)
                 dead = self.cute_dead.to(torch.bool)
                 moving = self.cute_moving.to(torch.bool)
+                rewards = self.cute_reward
+                won = self.cute_won.to(torch.bool)
+                truncated = self.cute_truncated.to(torch.bool)
+                self.heading.copy_(self.cute_new_heading)
+                self.start.copy_(self.cute_new_start)
+                self.length.copy_(self.cute_new_length)
+                self.episode_step.copy_(self.cute_new_episode_step)
+                self.steps_since_food.copy_(self.cute_new_steps_since_food)
+                self.done.copy_(self.cute_new_done.to(torch.bool))
+                self.episode_return.copy_(self.cute_new_episode_return)
             except Exception:
                 self.cute_step_enabled = False
                 head_row = torch.div(head_pos, self.board_size, rounding_mode="floor")
@@ -245,6 +333,14 @@ class TorchSnakeBatchEnv:
                 self_hit = occupied_next & ~legal_tail
                 dead = wall | self_hit
                 moving = active & ~dead
+                rewards = self.step_rewards
+                rewards.zero_()
+                rewards[active] += self.reward_step
+                rewards[dead] += self.reward_death
+                self.episode_step[active] += 1
+                self.heading[moving] = actions[moving]
+                won = moving & (self.length == self.num_cells)
+                truncated = moving & ~growing & (self.steps_since_food >= self.max_steps_since_food)
         else:
             head_row = torch.div(head_pos, self.board_size, rounding_mode="floor")
             head_col = head_pos % self.board_size
@@ -265,23 +361,26 @@ class TorchSnakeBatchEnv:
             self_hit = occupied_next & ~legal_tail
             dead = wall | self_hit
             moving = active & ~dead
+            rewards = self.step_rewards
+            rewards.zero_()
+            rewards[active] += self.reward_step
+            rewards[dead] += self.reward_death
+            self.episode_step[active] += 1
+            self.heading[moving] = actions[moving]
+            won = moving & (self.length == self.num_cells)
+            truncated = moving & ~growing & (self.steps_since_food >= self.max_steps_since_food)
         non_growing = moving & ~growing
-
-        rewards = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
-        rewards[active] += self.reward_step
-        rewards[dead] += self.reward_death
-
-        self.episode_step[active] += 1
-        self.heading[moving] = actions[moving]
 
         ng_indices = torch.nonzero(non_growing, as_tuple=False).flatten()
         if ng_indices.numel() > 0:
             ng_tail = tail_pos[ng_indices]
             self.occupancy[ng_indices, ng_tail] = False
-            self.occupancy_i64[ng_indices, ng_tail] = 0
+            if self.occupancy_i64 is not None:
+                self.occupancy_i64[ng_indices, ng_tail] = 0
             self.board[ng_indices, ng_tail] = 0
-            self.start[ng_indices] = (self.start[ng_indices] + 1) % self.num_cells
-            self.steps_since_food[ng_indices] += 1
+            if not self.cute_step_enabled:
+                self.start[ng_indices] = (self.start[ng_indices] + 1) % self.num_cells
+                self.steps_since_food[ng_indices] += 1
 
         mv_indices = torch.nonzero(moving, as_tuple=False).flatten()
         if mv_indices.numel() > 0:
@@ -292,14 +391,16 @@ class TorchSnakeBatchEnv:
             new_head = next_pos[mv_indices]
             self.body[mv_indices, new_slot] = new_head
             self.occupancy[mv_indices, new_head] = True
-            self.occupancy_i64[mv_indices, new_head] = 1
+            if self.occupancy_i64 is not None:
+                self.occupancy_i64[mv_indices, new_head] = 1
             self.board[mv_indices, new_head] = self.head_codes[self.heading[mv_indices]]
 
         grow_indices = torch.nonzero(growing, as_tuple=False).flatten()
         if grow_indices.numel() > 0:
-            self.length[grow_indices] += 1
-            self.steps_since_food[grow_indices] = 0
-            rewards[grow_indices] += self.reward_food
+            if not self.cute_step_enabled:
+                self.length[grow_indices] += 1
+                self.steps_since_food[grow_indices] = 0
+                rewards[grow_indices] += self.reward_food
             self.food[grow_indices] = -1
             still_running = grow_indices[self.length[grow_indices] < self.num_cells]
             if still_running.numel() > 0:
@@ -317,18 +418,23 @@ class TorchSnakeBatchEnv:
                         if new_food >= 0:
                             self.board[index, new_food] = 1
 
-        won = moving & (self.length == self.num_cells)
-        truncated = moving & ~growing & (self.steps_since_food >= self.max_steps_since_food)
-        done = dead | won | truncated
-        self.done |= done
-        self.episode_return += rewards
+        if not self.cute_step_enabled:
+            won = moving & (self.length == self.num_cells)
+            truncated = moving & ~growing & (self.steps_since_food >= self.max_steps_since_food)
+            done = dead | won | truncated
+            self.done |= done
+            self.episode_return += rewards
+        else:
+            done = self.done
 
+        self.info_final_coverage.copy_(self.length)
+        self.info_final_coverage.mul_(1.0 / float(self.num_cells))
         info = {
             "won": won,
             "truncated": truncated,
-            "final_coverage": self.length.to(torch.float32) / float(self.num_cells),
-            "episode_length": self.episode_step.clone(),
-            "episode_return": self.episode_return.clone(),
+            "final_coverage": self.info_final_coverage,
+            "episode_length": self.episode_step,
+            "episode_return": self.episode_return,
         }
         return self.observe(), rewards, done, info
 

@@ -2,7 +2,8 @@
 
 ## Scope
 
-This document records the baseline state before the first dedicated environment performance pass.
+This document records the historical baseline before the later wall-clock sweeps
+captured in `docs/performance_findings_02.md`.
 
 ## Baseline Outcome
 
@@ -13,6 +14,9 @@ The current project has a working PPO configuration that reaches the target eval
 - `runs/0118`: mean final coverage `0.871875` over 5 eval episodes using the default command path
 
 The default config at the time of this note is in `configs/base.yaml`.
+
+This is now a historical note only. The current fastest validated configuration is
+documented in `docs/performance_findings_02.md`.
 
 ## Baseline Throughput
 
@@ -77,3 +81,8 @@ Round 1 should do two things before more ambitious changes:
 ## CuTe DSL Direction
 
 CuTe DSL is installed and importable in the project environment. The next implementation goal is to move part of the environment hot path into a CuTe-backed kernel, starting with the most regular batched per-step computations rather than the full simulator rewrite in one jump.
+
+## Historical Status
+
+This document is intentionally left as the pre-optimization baseline. Subsequent CuTe,
+throughput, and convergence findings are tracked in `docs/performance_findings_02.md`.

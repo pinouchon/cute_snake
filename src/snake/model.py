@@ -9,6 +9,7 @@ class SnakePolicy(nn.Module):
     def __init__(
         self,
         board_size: int = 8,
+        trunk_channels: list[int] | tuple[int, int] = (32, 64),
         hidden_size: int = 128,
         model_type: str = "cnn",
         transformer_layers: int = 4,
@@ -18,9 +19,17 @@ class SnakePolicy(nn.Module):
         self.board_size = board_size
         self.model_type = model_type
         if model_type == "cnn":
-            self.conv1 = nn.Conv2d(7, 32, kernel_size=3, padding=1)
-            self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-            self.fc = nn.Linear(64 * board_size * board_size, hidden_size)
+            if len(trunk_channels) != 2:
+                raise ValueError(f"Expected exactly 2 trunk channels for cnn, got {trunk_channels!r}")
+            c1 = int(trunk_channels[0])
+            c2 = int(trunk_channels[1])
+            self.board_embedding = nn.Embedding(7, 7)
+            with torch.no_grad():
+                self.board_embedding.weight.copy_(torch.eye(7, dtype=torch.float32))
+            self.board_embedding.weight.requires_grad_(False)
+            self.conv1 = nn.Conv2d(7, c1, kernel_size=3, padding=1)
+            self.conv2 = nn.Conv2d(c1, c2, kernel_size=3, padding=1)
+            self.fc = nn.Linear(c2 * board_size * board_size, hidden_size)
         elif model_type == "transformer":
             self.token_embedding = nn.Embedding(7, hidden_size)
             self.position_embedding = nn.Parameter(
@@ -46,7 +55,7 @@ class SnakePolicy(nn.Module):
 
     def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self.model_type == "cnn":
-            x = F.one_hot(obs.long(), num_classes=7).permute(0, 3, 1, 2).to(torch.float32)
+            x = self.board_embedding(obs.long()).permute(0, 3, 1, 2)
             x = F.relu(self.conv1(x))
             x = F.relu(self.conv2(x))
             x = torch.flatten(x, start_dim=1)

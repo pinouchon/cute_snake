@@ -1,131 +1,115 @@
 # Performance Findings 02
 
-## Goal
+## Scope
 
-This document records the first two optimization rounds after the baseline in
-`docs/performance_findings_01.md`.
+This document records the current optimization state after the first CuTe integration
+attempts, trainer/env hot-path cleanup, and multiple 8-GPU wall-clock sweeps.
 
-The target remained:
+## Current Best Result
 
-- one GPU per run
-- maximize wall-clock speed
-- stop once mean final coverage over 5 eval episodes reaches `>= 0.80`
+The fastest validated run in the current tree is:
 
-## Round 1: Remove Obvious Host Bottlenecks
+- `runs/1200`
+  - mean final coverage over 5 eval episodes: `0.918750`
+  - time to first `eval_mean_final_coverage >= 0.80`: `31.033s`
+  - success update: `120`
+  - env steps at success: `7,864,320`
+  - launched from the plain default command after promoting `configs/base.yaml`
 
-### Changes
+This run uses:
 
-- Fixed the CUDA reset path so batched indexed resets actually write back into the source tensors.
-- Removed unconditional Python-side `torch.any(dones)` gating in training, evaluation, and the env benchmark.
-- Kept episode stat extraction limited to done subsets instead of copying whole tensors.
-- Preserved CPU/reference semantics for food spawning so tests still match the reference env exactly.
-
-### Effect
-
-Environment-only throughput improved immediately:
-
-- before: about `3.8k` env steps/sec at `2048` envs
-- after the reset/done cleanup: about `298.7k` env steps/sec at `2048` envs
-- same round at `4096` envs: about `597.0k` env steps/sec
-
-This was the largest single simulator speedup.
-
-## Round 2: CuTe Step Core and PPO Sweep
-
-### CuTe Integration
-
-CuTe DSL was kept as a real code path, not just a smoke test:
-
-- `src/snake/cute_kernels.py` now contains a working file-based CuTe compile path
-- the env can use a CuTe step core through `use_cute_step_core`
-- the CuTe smoke test passes in `tests/test_cute_smoke.py`
-
-### Important Observation
-
-The CuTe step core was not automatically the fastest in an env-only random-action benchmark:
-
-- non-CuTe env-only benchmark at `2048` envs: about `345.1k` steps/sec
-- CuTe env-only benchmark at `2048` envs: about `277.5k` steps/sec
-
-But the end-to-end training result was different: the CuTe-enabled training configuration still won on
-wall-clock to target once PPO overhead, action sampling, and checkpointing were included.
-
-## Parallel Sweep Results
-
-All 8 GPUs were used for parallel attempts in two rounds.
-
-### First Sweep
-
-Selected successful runs:
-
-- `runs/0301`: baseline-style no-AMP variant, success at update `120`, `64.241s`, eval coverage `0.803125`
-- `runs/0302`: `amp=true`, success at update `100`, `46.303s`, eval coverage `0.915625`
-- `runs/0303`: `amp=true`, `num_envs=4096`, success at update `110`, `52.863s`, eval coverage `0.884375`
-- `runs/0305`: `amp=true`, `num_envs=4096`, `update_epochs=2`, success at update `160`, `56.379s`, eval coverage `0.856250`
-
-Failed or weaker variants showed that larger batches and fewer update passes often raised raw SPS but
-hurt sample efficiency enough to lose overall wall-clock.
-
-### Second Sweep
-
-Targeted around the winner from `runs/0302`.
-
-Relevant runs:
-
-- `runs/0318`: `amp=true`, `save_latest=false`, `profile_interval_updates=0`, success at update `100`, `45.507s`, eval coverage `0.915625`
-- `runs/0321`: same as `runs/0318` plus `use_cute_step_core=true`, success at update `100`, `41.718s`, eval coverage `0.915625`
-- `runs/0322`: `use_cute_step_core=true`, `num_envs=3072`, success at update `110`, `43.825s`, eval coverage `0.931250`
-
-`runs/0321` is the best measured wall-clock result from these rounds.
-
-## Winning Config
-
-The fastest validated configuration from these experiments is:
-
-- `use_cute_step_core: true`
-- `amp: true`
-- `num_envs: 2048`
-- `rollout_steps: 32`
+- `use_cute_step_core: false`
+- `num_envs: 4096`
+- `rollout_steps: 16`
 - `minibatches: 8`
-- `update_epochs: 4`
-- `learning_rate: 1.0e-3`
-- `eval_interval: 10`
-- `checkpoint_interval: 10`
-- `save_latest: false`
-- `profile_interval_updates: 0`
+- `update_epochs: 2`
+- `learning_rate: 0.0022`
+- `trunk_channels: [24, 48]`
+- `hidden_size: 192`
+- `amp: true`
 
-Measured result:
+This configuration is now written into `configs/base.yaml`.
 
-- `runs/0321`
-- success at update `100`
-- `6,553,600` env steps
-- `41.718s` elapsed to first eval `>= 0.80`
-- first successful eval coverage `0.915625`
+## Best Known Runs
 
-## Default Config Promotion
+- `runs/1200`: `0.918750` coverage, `31.033s` to target
+- `runs/1100`: `0.918750` coverage, `31.292s` to target
+- `runs/1005`: `0.918750` coverage, `31.422s` to target
+- `runs/1010`: `0.918750` coverage, `31.564s` to target
+- `runs/1016`: `0.875000` coverage, `34.071s` to target
 
-The project default in `configs/base.yaml` was updated to match the winning configuration region:
+The repeated `4096 x 16`, `epochs=2`, `lr=0.0022`, `[24,48]/192` runs are effectively the
+same winner and show the result is stable rather than a one-off.
 
-- CuTe step core enabled
-- AMP enabled
-- per-update `latest.pt` saving disabled
-- profiling disabled by default
-- PPO settings restored to the best validated `2048 x 32 x 8 x 4` configuration
+## Throughput Findings
 
-## Validation
+Observed env-only and training-path measurements in the current tree:
 
-The final validation steps completed after the default promotion:
+- `scripts/bench_env.py --num-envs 2048 --steps 300 --device cuda`: about `742k` steps/sec before the latest cleanup
+- `scripts/bench_env.py --num-envs 2048 --steps 500 --device cuda`: about `769k` steps/sec after the latest cleanup
+- winning trainer runs in the `4096 x 16` family typically report about `450k-460k` train-loop SPS
 
-- `uv run pytest` -> `6 passed`
-- `CUDA_VISIBLE_DEVICES=0 uv run python scripts/train.py --run-dir runs/0401`
-  - console run hit success at update `100` with eval coverage `0.915625`
-- `uv run python scripts/eval.py --run-dir runs/0401`
-  - mean final coverage `0.915625`
+The gap between env-only SPS and trainer SPS is still material. Profiling and run behavior
+show the learner path remains the dominant wall-clock cost once the environment is reasonably fast.
 
-## Takeaways
+## What Helped
 
-1. The biggest win was removing host synchronization and broken batched reset behavior.
-2. AMP clearly helped the winner.
-3. Larger `num_envs` improved raw SPS but did not beat the best `2048`-env wall-clock result.
-4. Disabling per-update checkpoint writes was a real win.
-5. The CuTe path is worth keeping, but it should be judged on end-to-end training time, not only an env-only microbenchmark.
+The highest-confidence improvements were low-risk hot-path cleanups:
+
+1. Replaced per-forward `F.one_hot(...).to(torch.float32)` board encoding with a frozen identity embedding in `src/snake/model.py`.
+2. Switched rollout/eval inference from `torch.no_grad()` to `torch.inference_mode()`.
+3. Enabled fused Adam on CUDA in `src/snake/ppo.py`.
+4. Removed some per-step env allocations by reusing reward and coverage buffers in `src/snake/env_gpu.py`.
+5. Kept the smaller PPO model and fewer optimizer epochs:
+   - `[24,48]` trunk instead of `[32,64]`
+   - hidden size `192` instead of `256`
+   - `update_epochs: 2` instead of `3`
+
+These changes preserved convergence while improving throughput enough to bring the best
+validated wall-clock time down into the low-31-second range.
+
+## What Did Not Help
+
+Several plausible ideas did not beat the winning config:
+
+1. `eval_interval: 5`
+   - `runs/1101` hit the same success update as the winner, but more frequent eval added overhead.
+   - Result: `40.415s`, much worse than `31.033s`.
+
+2. More aggressive learning rates
+   - `runs/1011` with `lr=0.0024` topped out below target.
+   - `runs/1021` with `lr=0.0023` did succeed, but only at `41.342s`.
+
+3. Larger per-update batches through `4608 x 12`, `5120 x 12`, or `6144 x 8`
+   - `runs/1024`, `runs/1025`, and `runs/1016` all succeeded or nearly succeeded.
+   - None beat the `4096 x 16` winner in wall-clock time.
+
+4. Smaller model variants
+   - `runs/1022` (`hidden=160`) and `runs/1023` (`[20,40]/160`) converged, but slower.
+
+## CuTe Findings
+
+CuTe DSL is installed and working, and the project has a real integrated step-core path.
+However, the current CuTe-backed environment path is not the end-to-end winner yet.
+
+Findings:
+
+- Earlier env-only testing showed the CuTe path can improve raw simulator throughput.
+- In full training, the current integrated CuTe path still loses on convergence quality and/or total wall clock.
+- Recent focused runs:
+  - `runs/1014`: best eval coverage `0.718750`
+  - `runs/1015`: best eval coverage `0.575000`
+  - `runs/1027`: best eval coverage `0.718750`
+
+Interpretation:
+
+- The current fused/split CuTe integration is not preserving learning behavior well enough.
+- The project should keep the Torch fast path as default until a more fused CuTe implementation
+  matches Torch semantics and beats it on wall clock to target.
+
+## Current Recommendation
+
+Default to the Torch fast path with the winning `4096 x 16` PPO config.
+
+Use the CuTe path only for targeted kernel-development experiments until there is a
+Torch-vs-CuTe differential test suite and a CuTe implementation that matches current convergence.

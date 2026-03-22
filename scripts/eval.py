@@ -28,6 +28,7 @@ def main() -> None:
     device = torch.device(config["device"] if torch.cuda.is_available() else "cpu")
     model = SnakePolicy(
         board_size=int(config["board_size"]),
+        trunk_channels=list(config.get("trunk_channels", [32, 64])),
         hidden_size=int(config["hidden_size"]),
         model_type=str(config.get("model_type", "cnn")),
         transformer_layers=int(config.get("transformer_layers", 4)),

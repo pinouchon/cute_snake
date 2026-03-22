@@ -31,7 +31,8 @@ def main() -> None:
     for _ in range(args.steps):
         actions = torch.randint(0, 4, (args.num_envs,), device=env.device)
         _, _, dones, _ = env.step(actions)
-        env.reset(dones)
+        if bool(dones.any().item()):
+            env.reset(dones)
     if env.device.type == "cuda":
         torch.cuda.synchronize(env.device)
     elapsed = time.perf_counter() - start

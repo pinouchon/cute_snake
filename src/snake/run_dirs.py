@@ -8,6 +8,9 @@ from typing import Any
 def allocate_run_dir(root: str | Path = "runs", explicit: str | Path | None = None) -> Path:
     if explicit is not None:
         run_dir = Path(explicit)
+        if run_dir.exists():
+            if any(run_dir.iterdir()):
+                raise FileExistsError(f"Explicit run directory already exists and is not empty: {run_dir}")
         run_dir.mkdir(parents=True, exist_ok=True)
     else:
         root_path = Path(root)
@@ -26,4 +29,4 @@ def allocate_run_dir(root: str | Path = "runs", explicit: str | Path | None = No
 
 def append_jsonl(path: str | Path, record: dict[str, Any]) -> None:
     with Path(path).open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, sort_keys=True) + "\n")
+        handle.write(json.dumps(record, separators=(",", ":")) + "\n")

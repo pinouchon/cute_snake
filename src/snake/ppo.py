@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 from pathlib import Path
@@ -11,7 +12,6 @@ from torch.distributions import Categorical
 
 from snake.cute_kernels import capability_summary
 from snake.env_gpu import TorchSnakeBatchEnv
-from snake.eval import evaluate_policy
 from snake.model import SnakePolicy
 from snake.run_dirs import append_jsonl
 
@@ -48,9 +48,59 @@ def _sync_perf_counter(device: torch.device) -> float:
     return time.perf_counter()
 
 
+def _reset_eval_env(eval_env: TorchSnakeBatchEnv, seed: int) -> torch.Tensor:
+    eval_env.done.zero_()
+    eval_env.reset_counts.zero_()
+    if eval_env.cuda_generator is not None:
+        eval_env.cuda_generator.manual_seed(seed)
+    return eval_env.reset()
+
+
+def _evaluate_policy_cached(
+    model: torch.nn.Module,
+    *,
+    eval_env: TorchSnakeBatchEnv,
+    seed: int,
+) -> dict[str, Any]:
+    model.eval()
+    obs = _reset_eval_env(eval_env, seed)
+    device = obs.device
+    episodes = eval_env.num_envs
+    finished = torch.zeros(episodes, dtype=torch.bool, device=device)
+    final_coverages = torch.zeros(episodes, dtype=torch.float32, device=device)
+    final_returns = torch.zeros(episodes, dtype=torch.float32, device=device)
+    wins = torch.zeros(episodes, dtype=torch.int32, device=device)
+
+    with torch.inference_mode():
+        while not torch.all(finished):
+            mask = eval_env.action_mask()
+            logits, _ = model(obs)
+            masked_logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
+            actions = torch.argmax(masked_logits, dim=-1)
+            obs, _, dones, info = eval_env.step(actions)
+            just_finished = dones & ~finished
+            final_coverages[just_finished] = info["final_coverage"][just_finished]
+            final_returns[just_finished] = info["episode_return"][just_finished]
+            wins[just_finished] = info["won"][just_finished].to(torch.int32)
+            finished |= just_finished
+
+    return {
+        "mean_final_coverage": float(final_coverages.mean().item()),
+        "mean_episode_return": float(final_returns.mean().item()),
+        "coverages": final_coverages.detach().cpu().tolist(),
+        "episode_returns": final_returns.detach().cpu().tolist(),
+        "wins": int(wins.sum().item()),
+    }
+
+
 def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> dict[str, Any]:
     device = torch.device(config["device"] if torch.cuda.is_available() else "cpu")
     torch.manual_seed(int(config["seed"]))
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        precision = config.get("matmul_precision")
+        if precision:
+            torch.set_float32_matmul_precision(str(precision))
 
     env = TorchSnakeBatchEnv(
         num_envs=int(config["num_envs"]),
@@ -65,9 +115,23 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
         use_cute_step_core=bool(config.get("use_cute_step_core", False)),
     )
     obs = env.reset()
+    eval_seed = int(config["seed"]) + 10_000
+    eval_env = TorchSnakeBatchEnv(
+        num_envs=int(config["eval_episodes"]),
+        board_size=int(config["board_size"]),
+        max_steps_since_food=int(config["max_steps_since_food"]),
+        seed=eval_seed,
+        device=device,
+        initial_length=int(config["initial_length"]),
+        reward_food=float(config["reward_food"]),
+        reward_death=float(config["reward_death"]),
+        reward_step=float(config["reward_step"]),
+        use_cute_step_core=bool(config.get("use_cute_step_core", False)),
+    )
 
     model = SnakePolicy(
         board_size=int(config["board_size"]),
+        trunk_channels=list(config.get("trunk_channels", [32, 64])),
         hidden_size=int(config["hidden_size"]),
         model_type=str(config["model_type"]),
         transformer_layers=int(config["transformer_layers"]),
@@ -77,7 +141,12 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
     if init_checkpoint:
         checkpoint = torch.load(str(init_checkpoint), map_location=device)
         model.load_state_dict(checkpoint["model"])
-    optimizer = torch.optim.Adam(model.parameters(), lr=float(config["learning_rate"]))
+    if bool(config.get("compile_model", False)) and hasattr(torch, "compile"):
+        model = torch.compile(model, mode="reduce-overhead")  # type: ignore[assignment]
+    optimizer_kwargs: dict[str, Any] = {"lr": float(config["learning_rate"])}
+    if device.type == "cuda":
+        optimizer_kwargs["fused"] = True
+    optimizer = torch.optim.Adam(model.parameters(), **optimizer_kwargs)
 
     rollout_steps = int(config["rollout_steps"])
     num_envs = int(config["num_envs"])
@@ -132,7 +201,7 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
             mask = env.action_mask()
             masks_buf[step].copy_(mask)
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 with torch.autocast(device_type=device.type, enabled=scaler_enabled):
                     logits, values = model(obs)
                 dist = _masked_dist(logits, mask)
@@ -143,15 +212,15 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
             logprobs_buf[step].copy_(logprobs)
             values_buf[step].copy_(values.to(torch.float32))
 
-            _, rewards, dones, info = env.step(actions)
+            obs, rewards, dones, info = env.step(actions)
             rewards_buf[step].copy_(rewards)
             dones_buf[step].copy_(dones.to(torch.float32))
 
-            done_coverages = info["final_coverage"][dones]
-            done_returns = info["episode_return"][dones]
-            done_lengths = info["episode_length"][dones]
-            done_count = int(done_coverages.shape[0])
+            done_count = int(dones.sum().item())
             if done_count:
+                done_coverages = info["final_coverage"][dones]
+                done_returns = info["episode_return"][dones]
+                done_lengths = info["episode_length"][dones]
                 episode_count += done_count
                 episode_coverage_sum += float(done_coverages.sum().item())
                 episode_return_sum += float(done_returns.sum().item())
@@ -167,15 +236,14 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
                     recent_coverage = recent_decay * recent_coverage + (1.0 - recent_decay) * batch_mean_coverage
                     recent_return = recent_decay * recent_return + (1.0 - recent_decay) * batch_mean_return
                     recent_length = recent_decay * recent_length + (1.0 - recent_decay) * batch_mean_length
-            env.reset(dones)
-
-            obs = env.observe()
+                env.reset(dones)
+                obs = env.observe()
         if profile_update:
             rollout_seconds = _sync_perf_counter(device) - rollout_start
 
         if profile_update:
             gae_start = _sync_perf_counter(device)
-        with torch.no_grad():
+        with torch.inference_mode():
             _, next_values = model(obs)
 
         advantages, returns = _compute_gae(
@@ -281,20 +349,14 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
         if update % int(config["eval_interval"]) == 0 or update == int(config["total_updates"]):
             if profile_update:
                 eval_start = _sync_perf_counter(device)
-            evaluation = evaluate_policy(
+            evaluation = _evaluate_policy_cached(
                 model,
-                board_size=int(config["board_size"]),
-                max_steps_since_food=int(config["max_steps_since_food"]),
-                episodes=int(config["eval_episodes"]),
-                seed=int(config["seed"]) + 10_000,
-                device=device,
-                use_cute_step_core=bool(config.get("use_cute_step_core", False)),
+                eval_env=eval_env,
+                seed=eval_seed,
             )
             metrics["eval_mean_final_coverage"] = evaluation["mean_final_coverage"]
             metrics["eval_mean_episode_return"] = evaluation["mean_episode_return"]
             with (run_dir / str(config["eval_file"])).open("w", encoding="utf-8") as handle:
-                import json
-
                 json.dump(evaluation, handle, indent=2)
             if profile_update:
                 eval_seconds = _sync_perf_counter(device) - eval_start

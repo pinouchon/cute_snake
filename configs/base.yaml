@@ -13,26 +13,27 @@ env:
   initial_length: 3
   food_count: 1
   starvation_steps: 128
-  use_cute_step_core: true
+  use_cute_step_core: false
   reward_food: 1.0
   reward_death: -1.0
   reward_step: -0.01
 
 model:
-  trunk_channels: [32, 64]
-  hidden_dim: 256
+  trunk_channels: [24, 48]
+  hidden_dim: 192
+  compile_model: false
 
 ppo:
-  num_envs: 2048
-  rollout_len: 32
+  num_envs: 4096
+  rollout_len: 16
   minibatches: 8
-  update_epochs: 4
+  update_epochs: 2
   gamma: 0.995
   gae_lambda: 0.98
   clip_coef: 0.2
   value_coef: 0.5
   entropy_coef: 0.005
-  lr: 1.0e-3
+  lr: 2.2e-3
   max_grad_norm: 0.5
   total_updates: 160
 
@@ -41,6 +42,7 @@ runtime:
   console_log_interval_seconds: 10
   profile_interval_updates: 0
   save_latest: false
+  matmul_precision: high
 
 logging:
   metrics_file: metrics.jsonl

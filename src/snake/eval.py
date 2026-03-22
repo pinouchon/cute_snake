@@ -38,7 +38,7 @@ def evaluate_policy(
 
     while not torch.all(finished):
         mask = env.action_mask()
-        with torch.no_grad():
+        with torch.inference_mode():
             logits, _ = model(obs)
             masked_logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
             action = torch.argmax(masked_logits, dim=-1)
