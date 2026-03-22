@@ -8,96 +8,54 @@ from typing import Any
 
 import torch
 from torch import nn
-from torch.distributions import Categorical
 
 from snake.cute_kernels import capability_summary
 from snake.env_gpu import TorchSnakeBatchEnv
 from snake.model import SnakePolicy, load_policy_state
+from snake.ppo import _compute_gae, _evaluate_policy_cached, _masked_dist, _sync_perf_counter
 from snake.run_dirs import append_jsonl
 
 
-def _masked_dist(logits: torch.Tensor, mask: torch.Tensor) -> Categorical:
-    fill_value = torch.finfo(logits.dtype).min
-    return Categorical(logits=logits.masked_fill(~mask, fill_value))
+def build_policy(config: dict[str, Any]) -> SnakePolicy:
+    return SnakePolicy(
+        board_size=int(config["board_size"]),
+        trunk_channels=list(config.get("trunk_channels", [24, 48])),
+        hidden_size=int(config["hidden_size"]),
+        model_type=str(config.get("model_type", "cnn")),
+        transformer_layers=int(config.get("transformer_layers", 4)),
+        transformer_heads=int(config.get("transformer_heads", 8)),
+        channels_last=bool(config.get("channels_last", False)),
+    )
 
 
-def _compute_gae(
-    rewards: torch.Tensor,
-    dones: torch.Tensor,
-    values: torch.Tensor,
-    next_value: torch.Tensor,
-    gamma: float,
-    gae_lambda: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    advantages = torch.zeros_like(rewards)
-    last_advantage = torch.zeros(rewards.shape[1], dtype=torch.float32, device=rewards.device)
-    next_values = next_value
-    for step in reversed(range(rewards.shape[0])):
-        non_terminal = 1.0 - dones[step]
-        delta = rewards[step] + gamma * next_values * non_terminal - values[step]
-        last_advantage = delta + gamma * gae_lambda * non_terminal * last_advantage
-        advantages[step] = last_advantage
-        next_values = values[step]
-    returns = advantages + values
-    return advantages, returns
+def load_checkpoint_into_policy(model: SnakePolicy, state_dict: dict[str, Any]) -> None:
+    load_policy_state(model, state_dict)
 
 
-def _sync_perf_counter(device: torch.device) -> float:
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-    return time.perf_counter()
-
-
-def _reset_eval_env(eval_env: TorchSnakeBatchEnv, seed: int) -> torch.Tensor:
-    eval_env.done.zero_()
-    eval_env.reset_counts.zero_()
-    if eval_env.cuda_generator is not None:
-        eval_env.cuda_generator.manual_seed(seed)
-    return eval_env.reset()
-
-
-def _evaluate_policy_cached(
-    model: torch.nn.Module,
+def _should_eval(
+    update: int,
     *,
-    eval_env: TorchSnakeBatchEnv,
-    seed: int,
-) -> dict[str, Any]:
-    model.eval()
-    obs = _reset_eval_env(eval_env, seed)
-    device = obs.device
-    episodes = eval_env.num_envs
-    finished = torch.zeros(episodes, dtype=torch.bool, device=device)
-    final_coverages = torch.zeros(episodes, dtype=torch.float32, device=device)
-    final_returns = torch.zeros(episodes, dtype=torch.float32, device=device)
-    wins = torch.zeros(episodes, dtype=torch.int32, device=device)
-
-    with torch.inference_mode():
-        while not torch.all(finished):
-            mask = eval_env.action_mask()
-            logits, _ = model(obs)
-            masked_logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
-            actions = torch.argmax(masked_logits, dim=-1)
-            obs, _, dones, info = eval_env.step(actions)
-            just_finished = dones & ~finished
-            final_coverages[just_finished] = info["final_coverage"][just_finished]
-            final_returns[just_finished] = info["episode_return"][just_finished]
-            wins[just_finished] = info["won"][just_finished].to(torch.int32)
-            finished |= just_finished
-
-    return {
-        "mean_final_coverage": float(final_coverages.mean().item()),
-        "mean_episode_return": float(final_returns.mean().item()),
-        "coverages": final_coverages.detach().cpu().tolist(),
-        "episode_returns": final_returns.detach().cpu().tolist(),
-        "wins": int(wins.sum().item()),
-    }
-
-
-def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> dict[str, Any]:
+    total_updates: int,
+    eval_interval: int,
+    eval_after_update: int,
+    eval_interval_after: int,
+    eval_recent_coverage_gate: float,
+    recent_coverage: float,
+) -> bool:
+    if update == total_updates:
+        return True
+    if eval_recent_coverage_gate > 0.0 and recent_coverage < eval_recent_coverage_gate:
+        return False
+    if eval_interval_after > 0 and update >= eval_after_update > 0:
+        return (update - eval_after_update) % eval_interval_after == 0
+    return update % eval_interval == 0
+def train(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> dict[str, Any]:
     device = torch.device(config["device"] if torch.cuda.is_available() else "cpu")
     torch.manual_seed(int(config["seed"]))
     if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = bool(config.get("allow_tf32", True))
+        torch.backends.cudnn.allow_tf32 = bool(config.get("allow_tf32", True))
+        torch.backends.cudnn.benchmark = bool(config.get("cudnn_benchmark", True))
         precision = config.get("matmul_precision")
         if precision:
             torch.set_float32_matmul_precision(str(precision))
@@ -129,20 +87,16 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
         use_cute_step_core=bool(config.get("use_cute_step_core", False)),
     )
 
-    model = SnakePolicy(
-        board_size=int(config["board_size"]),
-        trunk_channels=list(config.get("trunk_channels", [32, 64])),
-        hidden_size=int(config["hidden_size"]),
-        model_type=str(config["model_type"]),
-        transformer_layers=int(config["transformer_layers"]),
-        transformer_heads=int(config["transformer_heads"]),
-    ).to(device)
+    model = build_policy(config).to(device)
+    if bool(config.get("channels_last", False)) and str(config.get("model_type", "cnn")) == "cnn":
+        model = model.to(memory_format=torch.channels_last)
     init_checkpoint = config.get("init_checkpoint")
     if init_checkpoint:
         checkpoint = torch.load(str(init_checkpoint), map_location=device)
         load_policy_state(model, checkpoint["model"])
     if bool(config.get("compile_model", False)) and hasattr(torch, "compile"):
         model = torch.compile(model, mode="reduce-overhead")  # type: ignore[assignment]
+
     optimizer_kwargs: dict[str, Any] = {"lr": float(config["learning_rate"])}
     if device.type == "cuda":
         optimizer_kwargs["fused"] = True
@@ -168,14 +122,17 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
     checkpoint_dir = run_dir / str(config["checkpoint_dir"])
     scaler_enabled = bool(config.get("amp", False)) and device.type == "cuda"
     scaler = torch.amp.GradScaler(device.type, enabled=scaler_enabled)
+    amp_dtype_name = str(config.get("amp_dtype", "float16")).lower()
+    amp_dtype = torch.float16 if amp_dtype_name == "float16" else torch.bfloat16
 
-    episode_count = 0
-    episode_coverage_sum = 0.0
-    episode_return_sum = 0.0
-    episode_length_sum = 0.0
-    recent_coverage = 0.0
-    recent_return = 0.0
-    recent_length = 0.0
+    episode_count_t = torch.zeros((), dtype=torch.long, device=device)
+    episode_coverage_sum_t = torch.zeros((), dtype=torch.float32, device=device)
+    episode_return_sum_t = torch.zeros((), dtype=torch.float32, device=device)
+    episode_length_sum_t = torch.zeros((), dtype=torch.float32, device=device)
+    recent_coverage_t = torch.zeros((), dtype=torch.float32, device=device)
+    recent_return_t = torch.zeros((), dtype=torch.float32, device=device)
+    recent_length_t = torch.zeros((), dtype=torch.float32, device=device)
+    have_recent_stats = False
     recent_decay = 0.9
     start_time = time.perf_counter()
     last_console_log = start_time
@@ -202,7 +159,7 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
             masks_buf[step].copy_(mask)
 
             with torch.inference_mode():
-                with torch.autocast(device_type=device.type, enabled=scaler_enabled):
+                with torch.autocast(device_type=device.type, enabled=scaler_enabled, dtype=amp_dtype):
                     logits, values = model(obs)
                 dist = _masked_dist(logits, mask)
                 actions = dist.sample()
@@ -216,26 +173,27 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
             rewards_buf[step].copy_(rewards)
             dones_buf[step].copy_(dones.to(torch.float32))
 
-            done_count = int(dones.sum().item())
-            if done_count:
-                done_coverages = info["final_coverage"][dones]
-                done_returns = info["episode_return"][dones]
-                done_lengths = info["episode_length"][dones]
-                episode_count += done_count
-                episode_coverage_sum += float(done_coverages.sum().item())
-                episode_return_sum += float(done_returns.sum().item())
-                episode_length_sum += float(done_lengths.sum().item())
-                batch_mean_coverage = float(done_coverages.mean().item())
-                batch_mean_return = float(done_returns.mean().item())
-                batch_mean_length = float(done_lengths.to(torch.float32).mean().item())
-                if episode_count == done_count:
-                    recent_coverage = batch_mean_coverage
-                    recent_return = batch_mean_return
-                    recent_length = batch_mean_length
+            done_indices = torch.nonzero(dones, as_tuple=False).flatten()
+            if done_indices.numel() > 0:
+                done_coverages = info["final_coverage"][done_indices]
+                done_returns = info["episode_return"][done_indices]
+                done_lengths = info["episode_length"][done_indices].to(torch.float32)
+                episode_count_t += done_indices.numel()
+                episode_coverage_sum_t += done_coverages.sum()
+                episode_return_sum_t += done_returns.sum()
+                episode_length_sum_t += done_lengths.sum()
+                batch_mean_coverage_t = done_coverages.mean()
+                batch_mean_return_t = done_returns.mean()
+                batch_mean_length_t = done_lengths.mean()
+                if not have_recent_stats:
+                    recent_coverage_t = batch_mean_coverage_t
+                    recent_return_t = batch_mean_return_t
+                    recent_length_t = batch_mean_length_t
+                    have_recent_stats = True
                 else:
-                    recent_coverage = recent_decay * recent_coverage + (1.0 - recent_decay) * batch_mean_coverage
-                    recent_return = recent_decay * recent_return + (1.0 - recent_decay) * batch_mean_return
-                    recent_length = recent_decay * recent_length + (1.0 - recent_decay) * batch_mean_length
+                    recent_coverage_t = recent_decay * recent_coverage_t + (1.0 - recent_decay) * batch_mean_coverage_t
+                    recent_return_t = recent_decay * recent_return_t + (1.0 - recent_decay) * batch_mean_return_t
+                    recent_length_t = recent_decay * recent_length_t + (1.0 - recent_decay) * batch_mean_length_t
                 env.reset(dones)
                 obs = env.observe()
         if profile_update:
@@ -244,7 +202,8 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
         if profile_update:
             gae_start = _sync_perf_counter(device)
         with torch.inference_mode():
-            _, next_values = model(obs)
+            with torch.autocast(device_type=device.type, enabled=scaler_enabled, dtype=amp_dtype):
+                _, next_values = model(obs)
 
         advantages, returns = _compute_gae(
             rewards=rewards_buf,
@@ -269,13 +228,17 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
         policy_loss_value = 0.0
         value_loss_value = 0.0
         entropy_value = 0.0
+        policy_loss_tensor = torch.zeros((), dtype=torch.float32, device=device)
+        value_loss_tensor = torch.zeros((), dtype=torch.float32, device=device)
+        entropy_tensor = torch.zeros((), dtype=torch.float32, device=device)
 
         if profile_update:
             optimize_start = _sync_perf_counter(device)
         for _ in range(int(config["update_epochs"])):
-            indices = torch.randperm(batch_size, device=device)
+            epoch_indices = torch.randperm(batch_size, device=device)
             for start in range(0, batch_size, minibatch_size):
-                mb_indices = indices[start : start + minibatch_size]
+                stop = start + minibatch_size
+                mb_indices = epoch_indices[start:stop]
                 mb_obs = b_obs[mb_indices]
                 mb_actions = b_actions[mb_indices]
                 mb_old_logprobs = b_logprobs[mb_indices]
@@ -284,7 +247,7 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
                 mb_old_values = b_values[mb_indices]
                 mb_masks = b_masks[mb_indices]
 
-                with torch.autocast(device_type=device.type, enabled=scaler_enabled):
+                with torch.autocast(device_type=device.type, enabled=scaler_enabled, dtype=amp_dtype):
                     logits, new_values = model(mb_obs)
                     dist = _masked_dist(logits, mb_masks)
                     new_logprobs = dist.log_prob(mb_actions)
@@ -322,11 +285,22 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
                 scaler.step(optimizer)
                 scaler.update()
 
-                policy_loss_value = float(policy_loss.detach().cpu().item())
-                value_loss_value = float(value_loss.detach().cpu().item())
-                entropy_value = float(entropy.detach().cpu().item())
+                policy_loss_tensor = policy_loss.detach().to(torch.float32)
+                value_loss_tensor = value_loss.detach().to(torch.float32)
+                entropy_tensor = entropy.detach().to(torch.float32)
         if profile_update:
             optimize_seconds = _sync_perf_counter(device) - optimize_start
+
+        policy_loss_value = float(policy_loss_tensor.item())
+        value_loss_value = float(value_loss_tensor.item())
+        entropy_value = float(entropy_tensor.item())
+        episode_count = int(episode_count_t.item())
+        recent_coverage = float(recent_coverage_t.item())
+        recent_return = float(recent_return_t.item())
+        recent_length = float(recent_length_t.item())
+        mean_completed_final_coverage = float((episode_coverage_sum_t / episode_count_t.clamp(min=1)).item())
+        mean_completed_episode_return = float((episode_return_sum_t / episode_count_t.clamp(min=1)).item())
+        mean_completed_episode_length = float((episode_length_sum_t / episode_count_t.clamp(min=1)).item())
 
         metrics = {
             "update": update,
@@ -337,9 +311,9 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
             "value_loss": value_loss_value,
             "entropy": entropy_value,
             "episodes_completed": episode_count,
-            "mean_completed_final_coverage": episode_coverage_sum / max(1, episode_count),
-            "mean_completed_episode_return": episode_return_sum / max(1, episode_count),
-            "mean_completed_episode_length": episode_length_sum / max(1, episode_count),
+            "mean_completed_final_coverage": mean_completed_final_coverage,
+            "mean_completed_episode_return": mean_completed_episode_return,
+            "mean_completed_episode_length": mean_completed_episode_length,
             "mean_recent_final_coverage": recent_coverage,
             "mean_recent_episode_return": recent_return,
             "mean_recent_episode_length": recent_length,
@@ -348,15 +322,22 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
             metrics["rollout_seconds"] = rollout_seconds
             metrics["gae_seconds"] = gae_seconds
             metrics["optimize_seconds"] = optimize_seconds
+            metrics["learner_samples_per_second"] = (
+                (int(config["update_epochs"]) * batch_size) / max(optimize_seconds, 1e-6)
+            )
 
-        if update % int(config["eval_interval"]) == 0 or update == int(config["total_updates"]):
+        if _should_eval(
+            update,
+            total_updates=int(config["total_updates"]),
+            eval_interval=int(config["eval_interval"]),
+            eval_after_update=int(config.get("eval_after_update", 0)),
+            eval_interval_after=int(config.get("eval_interval_after", 0)),
+            eval_recent_coverage_gate=float(config.get("eval_recent_coverage_gate", 0.0)),
+            recent_coverage=recent_coverage,
+        ):
             if profile_update:
                 eval_start = _sync_perf_counter(device)
-            evaluation = _evaluate_policy_cached(
-                model,
-                eval_env=eval_env,
-                seed=eval_seed,
-            )
+            evaluation = _evaluate_policy_cached(model, eval_env=eval_env, seed=eval_seed)
             metrics["eval_mean_final_coverage"] = evaluation["mean_final_coverage"]
             metrics["eval_mean_episode_return"] = evaluation["mean_episode_return"]
             with (run_dir / str(config["eval_file"])).open("w", encoding="utf-8") as handle:
@@ -366,14 +347,8 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
                 metrics["eval_seconds"] = eval_seconds
             if evaluation["mean_final_coverage"] > best_eval:
                 best_eval = evaluation["mean_final_coverage"]
-                torch.save(
-                    {"model": model.state_dict(), "config": config},
-                    checkpoint_dir / "best.pt",
-                )
-            if (
-                bool(config["stop_on_success"])
-                and evaluation["mean_final_coverage"] >= float(config["success_target"])
-            ):
+                torch.save({"model": model.state_dict(), "config": config}, checkpoint_dir / "best.pt")
+            if bool(config["stop_on_success"]) and evaluation["mean_final_coverage"] >= float(config["success_target"]):
                 success_reached = True
 
         if profile_update and (bool(config["save_latest"]) or update % int(config["checkpoint_interval"]) == 0):
@@ -383,6 +358,7 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
         if profile_update and (bool(config["save_latest"]) or update % int(config["checkpoint_interval"]) == 0):
             checkpoint_seconds = _sync_perf_counter(device) - checkpoint_start
             metrics["checkpoint_seconds"] = checkpoint_seconds
+
         append_jsonl(metrics_path, metrics)
         now = time.perf_counter()
         if (
@@ -412,6 +388,6 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
     return {
         "run_dir": str(run_dir),
         "best_eval_mean_final_coverage": best_eval,
-        "episodes_completed": episode_count,
+        "episodes_completed": int(episode_count_t.item()),
         "success_reached": success_reached,
     }

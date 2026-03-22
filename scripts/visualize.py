@@ -7,9 +7,9 @@ import time
 
 import torch
 
+from snake.api import load_policy_from_checkpoint
 from snake.config import load_yaml_config
 from snake.env_reference import ReferenceSnakeEnv
-from snake.model import SnakePolicy
 
 
 CELL_GLYPHS = {
@@ -31,6 +31,17 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_checkpoint_path(run_dir: Path, checkpoint_name: str) -> Path:
+    checkpoint_path = run_dir / "checkpoints" / checkpoint_name
+    if checkpoint_path.exists():
+        return checkpoint_path
+    if checkpoint_name == "latest.pt":
+        fallback = run_dir / "checkpoints" / "best.pt"
+        if fallback.exists():
+            return fallback
+    raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+
 def render_frame(obs: torch.Tensor) -> str:
     board = obs.cpu().tolist()
     rows = []
@@ -43,19 +54,10 @@ def main() -> None:
     args = parse_args()
     run_dir = Path(args.run_dir)
     config = load_yaml_config(run_dir / "config.yaml")
-    checkpoint = torch.load(run_dir / "checkpoints" / args.checkpoint, map_location="cpu")
+    checkpoint = torch.load(resolve_checkpoint_path(run_dir, args.checkpoint), map_location="cpu")
 
     device = torch.device(config["device"] if torch.cuda.is_available() else "cpu")
-    model = SnakePolicy(
-        board_size=int(config["board_size"]),
-        trunk_channels=list(config.get("trunk_channels", [32, 64])),
-        hidden_size=int(config["hidden_size"]),
-        model_type=str(config.get("model_type", "cnn")),
-        transformer_layers=int(config.get("transformer_layers", 4)),
-        transformer_heads=int(config.get("transformer_heads", 8)),
-    )
-    model.load_state_dict(checkpoint["model"])
-    model.to(device)
+    model = load_policy_from_checkpoint(config, checkpoint, device)
     model.eval()
 
     env = ReferenceSnakeEnv(

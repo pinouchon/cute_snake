@@ -35,6 +35,16 @@ class TorchSnakeBatchEnv:
         self.reward_step = reward_step
         self.use_fast_cuda = self.device.type == "cuda"
         self.head_codes = torch.tensor([3, 4, 5, 6], dtype=torch.uint8, device=self.device)
+        self.action_mask_table = torch.tensor(
+            [
+                [True, True, False, True],
+                [True, True, True, False],
+                [False, True, True, True],
+                [True, False, True, True],
+            ],
+            dtype=torch.bool,
+            device=self.device,
+        )
         self.offsets = torch.tensor(
             [
                 [-1, 0],
@@ -200,10 +210,7 @@ class TorchSnakeBatchEnv:
         return self.board.view(self.num_envs, self.board_size, self.board_size)
 
     def action_mask(self) -> torch.Tensor:
-        mask = torch.ones((self.num_envs, 4), dtype=torch.bool, device=self.device)
-        reverse = (self.heading + 2) % 4
-        mask.scatter_(1, reverse.unsqueeze(1), False)
-        return mask
+        return self.action_mask_table[self.heading]
 
     def snapshot(self, index: int = 0) -> dict[str, Any]:
         start = int(self.start[index].item())

@@ -12,8 +12,6 @@ from typing import Any
 
 import yaml
 
-from snake.run_dirs import allocate_run_dir
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -62,6 +60,17 @@ def _preview_next_run_dir(root: str | Path) -> Path:
     return root_path / f"{(max(existing, default=0) + 1):04d}"
 
 
+def _plan_run_dirs(root: str | Path, count: int) -> list[Path]:
+    root_path = Path(root)
+    existing = [
+        int(path.name)
+        for path in root_path.iterdir()
+        if path.is_dir() and path.name.isdigit()
+    ] if root_path.exists() else []
+    start = max(existing, default=0) + 1
+    return [root_path / f"{start + offset:04d}" for offset in range(count)]
+
+
 def _launch_output_relay(prefix: str, stream) -> threading.Thread:
     def _relay() -> None:
         for line in iter(stream.readline, ""):
@@ -94,10 +103,11 @@ def main() -> None:
     if not selected:
         raise ValueError("No configurations selected")
 
+    planned_run_dirs = _plan_run_dirs(args.runs_root, len(selected))
     launched: list[dict[str, Any]] = []
     for index, overrides in enumerate(selected):
         gpu = gpus[index % len(gpus)]
-        run_dir = _preview_next_run_dir(args.runs_root) if args.dry_run else allocate_run_dir(args.runs_root)
+        run_dir = planned_run_dirs[index]
         command = [
             "uv",
             "run",

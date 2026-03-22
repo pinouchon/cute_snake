@@ -113,3 +113,78 @@ Default to the Torch fast path with the winning `4096 x 16` PPO config.
 
 Use the CuTe path only for targeted kernel-development experiments until there is a
 Torch-vs-CuTe differential test suite and a CuTe implementation that matches current convergence.
+
+## Scratch-Only Aggressive Follow-Up
+
+After the warm-start experiments were ruled out as invalid for the real target, I ran
+additional scratch-only sweeps anchored to the `1030/1020/1200` family.
+
+Key outcome:
+
+- The best scratch run is still `runs/1030` at `30.453s` to first `>= 0.80` eval coverage.
+- A clean control rerun, `runs/1500`, matched that family at `31.271s`.
+
+Aggressive scratch variants that did **not** beat the baseline:
+
+- `runs/1505`
+  - `4096 x 16`, `update_epochs=3`, `entropy_coef=0.01`, `use_value_clipping=false`
+  - best aggressive variant
+  - reached target in `45.104s`
+- `runs/1503`
+  - `2048 x 32`, `update_epochs=4`, `lr=0.001`, `entropy_coef=0.01`
+  - reached target in `60.987s`
+- `runs/1504`
+  - `3072 x 16`, `update_epochs=4`, `lr=0.0012`, `entropy_coef=0.01`
+  - reached target in `56.792s`
+- `runs/1502`
+  - `2048 x 16`, `update_epochs=6`, `lr=0.0015`, `entropy_coef=0.01`
+  - reached target in `66.539s`
+
+High-variance low-horizon scratch variants all regressed:
+
+- `runs/1501`
+  - `4096 x 8`, `update_epochs=4`, smaller model
+  - failed, best eval coverage `0.71875`
+- `runs/1510`
+  - aggressive low-horizon PPO with shorter discount horizon
+  - failed, best eval coverage `0.625`
+- `runs/1511`
+  - `8192 x 8`, larger PPO step, smaller model
+  - failed, best eval coverage `0.50625`
+- `runs/1512`
+  - `4096 x 12`, more aggressive PPO settings
+  - failed, best eval coverage `0.56875`
+- `runs/1513`
+  - `4096 x 8`, `update_epochs=5`, larger model
+  - failed, best eval coverage `0.484375`
+- `runs/1514`
+  - weak-critic / unclipped-value aggressive PPO
+  - failed, best eval coverage `0.521875`
+- `runs/1515`
+  - loose clipping, no value clipping, `4096 x 12`
+  - failed, best eval coverage `0.503125`
+- `runs/1516`
+  - slower high-quality-update variant
+  - failed, best eval coverage `0.484375`
+- `runs/1517`
+  - throughput-first CuTe path, `8192 x 4`, `update_epochs=1`
+  - failed, best eval coverage `0.165625`
+
+Interpretation:
+
+- From-scratch PPO appears to be limited more by learning dynamics than raw env speed.
+- Lowering horizon aggressively hurts early learning more than it helps update freshness.
+- The current CuTe path can drive extreme env SPS, but that does not translate into earlier
+  success from scratch under the current PPO setup.
+- The bounded code changes added for experimentation:
+  - `mlp` model type
+  - variable-depth CNN trunks
+  - `use_value_clipping` toggle
+  did not unlock a meaningful wall-clock win in the first scratch sweeps.
+
+Current conclusion:
+
+- Sub-10-second convergence from scratch was **not** achieved.
+- The next realistic path is a larger change than hyperparameter tuning:
+  1. a truly fused end-to-end CuTe transition kernel that removes the remaining host-side env patching, or
+  2. a materially different training update path that cuts optimizer cost while preserving sample efficiency.

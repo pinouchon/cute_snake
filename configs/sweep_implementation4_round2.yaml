@@ -1,0 +1,11 @@
+base: configs/implementation4.yaml
+sweep:
+  ppo.entropy_coef:
+    - 0.005
+    - 0.0025
+  ppo.update_epochs:
+    - 2
+    - 3
+  ppo.lr:
+    - 0.0022
+    - 0.0026

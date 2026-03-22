@@ -1,5 +1,5 @@
 project: cute-snake
-implementation: implementation1
+implementation: implementation3
 seed: 106
 device: cuda
 run_root: runs
@@ -20,23 +20,27 @@ env:
   reward_step: -0.01
 
 model:
+  type: axial
   trunk_channels: [24, 48]
-  hidden_dim: 192
+  hidden_dim: 128
+  transformer_layers: 2
+  transformer_heads: 4
   compile_model: false
 
 ppo:
   num_envs: 4096
   rollout_len: 16
-  minibatches: 8
+  minibatches: 4
   update_epochs: 2
   gamma: 0.995
   gae_lambda: 0.98
   clip_coef: 0.2
   value_coef: 0.5
   entropy_coef: 0.005
-  lr: 2.2e-3
+  use_value_clipping: true
+  lr: 2.0e-3
   max_grad_norm: 0.5
-  total_updates: 160
+  total_updates: 200
 
 runtime:
   amp: true

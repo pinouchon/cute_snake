@@ -4,8 +4,8 @@ import argparse
 import logging
 from pathlib import Path
 
+from snake.api import train
 from snake.config import apply_overrides, load_yaml_config, normalize_config, save_yaml_config
-from snake.ppo import train_ppo
 from snake.run_dirs import allocate_run_dir
 
 
@@ -29,7 +29,7 @@ def main() -> None:
     logger.addHandler(logging.StreamHandler())
     logger.addHandler(logging.FileHandler(run_dir / "train.log", encoding="utf-8"))
 
-    result = train_ppo(config, Path(run_dir), logger)
+    result = train(config, Path(run_dir), logger)
     logger.info("training_complete=%s", result)
 
 

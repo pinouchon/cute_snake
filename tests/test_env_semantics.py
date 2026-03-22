@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import pytest
+import torch
 
 from snake.env_reference import ReferenceSnakeEnv
+from snake.env_gpu import TorchSnakeBatchEnv
 
 
 def test_invalid_reverse_continues_straight() -> None:
@@ -34,3 +36,20 @@ def test_wall_collision_ends_episode() -> None:
     assert done
     assert reward == pytest.approx(-1.01)
     assert info["episode_length"] == 1
+
+
+def test_gpu_action_mask_matches_heading_reverse_rule() -> None:
+    env = TorchSnakeBatchEnv(num_envs=4, device="cpu")
+    env.reset()
+    env.heading.copy_(torch.tensor([0, 1, 2, 3], dtype=torch.long))
+    mask = env.action_mask()
+    expected = torch.tensor(
+        [
+            [True, True, False, True],
+            [True, True, True, False],
+            [False, True, True, True],
+            [True, False, True, True],
+        ],
+        dtype=torch.bool,
+    )
+    assert torch.equal(mask.cpu(), expected)
