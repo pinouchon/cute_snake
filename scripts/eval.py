@@ -41,8 +41,9 @@ def main() -> None:
         board_size=int(config["board_size"]),
         max_steps_since_food=int(config["max_steps_since_food"]),
         episodes=args.episodes or int(config["eval_episodes"]),
-        seed=int(config["seed"]) + 20_000,
+        seed=int(config["seed"]) + 10_000,
         device=device,
+        use_cute_step_core=bool(config.get("use_cute_step_core", False)),
     )
     print(json.dumps(result, indent=2))
 

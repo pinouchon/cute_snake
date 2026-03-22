@@ -42,6 +42,12 @@ def _compute_gae(
     return advantages, returns
 
 
+def _sync_perf_counter(device: torch.device) -> float:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    return time.perf_counter()
+
+
 def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> dict[str, Any]:
     device = torch.device(config["device"] if torch.cuda.is_available() else "cpu")
     torch.manual_seed(int(config["seed"]))
@@ -56,6 +62,7 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
         reward_food=float(config["reward_food"]),
         reward_death=float(config["reward_death"]),
         reward_step=float(config["reward_step"]),
+        use_cute_step_core=bool(config.get("use_cute_step_core", False)),
     )
     obs = env.reset()
 
@@ -93,9 +100,14 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
     scaler_enabled = bool(config.get("amp", False)) and device.type == "cuda"
     scaler = torch.amp.GradScaler(device.type, enabled=scaler_enabled)
 
-    episode_coverages: list[float] = []
-    episode_returns: list[float] = []
-    episode_lengths: list[int] = []
+    episode_count = 0
+    episode_coverage_sum = 0.0
+    episode_return_sum = 0.0
+    episode_length_sum = 0.0
+    recent_coverage = 0.0
+    recent_return = 0.0
+    recent_length = 0.0
+    recent_decay = 0.9
     start_time = time.perf_counter()
     last_console_log = start_time
 
@@ -103,8 +115,18 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
 
     for update in range(1, int(config["total_updates"]) + 1):
         update_start = time.perf_counter()
+        profile_update = int(config["profile_interval_updates"]) > 0 and (
+            update % int(config["profile_interval_updates"]) == 0 or update == 1
+        )
+        rollout_seconds = 0.0
+        gae_seconds = 0.0
+        optimize_seconds = 0.0
+        eval_seconds = 0.0
+        checkpoint_seconds = 0.0
         model.train()
 
+        if profile_update:
+            rollout_start = _sync_perf_counter(device)
         for step in range(rollout_steps):
             obs_buf[step].copy_(obs)
             mask = env.action_mask()
@@ -125,19 +147,34 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
             rewards_buf[step].copy_(rewards)
             dones_buf[step].copy_(dones.to(torch.float32))
 
-            if torch.any(dones):
-                done_indices = torch.nonzero(dones, as_tuple=False).flatten().tolist()
-                coverages = info["final_coverage"].detach().cpu().tolist()
-                returns = info["episode_return"].detach().cpu().tolist()
-                lengths = info["episode_length"].detach().cpu().tolist()
-                for index in done_indices:
-                    episode_coverages.append(float(coverages[index]))
-                    episode_returns.append(float(returns[index]))
-                    episode_lengths.append(int(lengths[index]))
-                env.reset(dones)
+            done_coverages = info["final_coverage"][dones]
+            done_returns = info["episode_return"][dones]
+            done_lengths = info["episode_length"][dones]
+            done_count = int(done_coverages.shape[0])
+            if done_count:
+                episode_count += done_count
+                episode_coverage_sum += float(done_coverages.sum().item())
+                episode_return_sum += float(done_returns.sum().item())
+                episode_length_sum += float(done_lengths.sum().item())
+                batch_mean_coverage = float(done_coverages.mean().item())
+                batch_mean_return = float(done_returns.mean().item())
+                batch_mean_length = float(done_lengths.to(torch.float32).mean().item())
+                if episode_count == done_count:
+                    recent_coverage = batch_mean_coverage
+                    recent_return = batch_mean_return
+                    recent_length = batch_mean_length
+                else:
+                    recent_coverage = recent_decay * recent_coverage + (1.0 - recent_decay) * batch_mean_coverage
+                    recent_return = recent_decay * recent_return + (1.0 - recent_decay) * batch_mean_return
+                    recent_length = recent_decay * recent_length + (1.0 - recent_decay) * batch_mean_length
+            env.reset(dones)
 
             obs = env.observe()
+        if profile_update:
+            rollout_seconds = _sync_perf_counter(device) - rollout_start
 
+        if profile_update:
+            gae_start = _sync_perf_counter(device)
         with torch.no_grad():
             _, next_values = model(obs)
 
@@ -150,6 +187,8 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
             gae_lambda=float(config["gae_lambda"]),
         )
         advantages = (advantages - advantages.mean()) / (advantages.std().clamp(min=1e-6))
+        if profile_update:
+            gae_seconds = _sync_perf_counter(device) - gae_start
 
         b_obs = obs_buf.reshape(batch_size, env.board_size, env.board_size)
         b_actions = actions_buf.reshape(batch_size)
@@ -163,6 +202,8 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
         value_loss_value = 0.0
         entropy_value = 0.0
 
+        if profile_update:
+            optimize_start = _sync_perf_counter(device)
         for _ in range(int(config["update_epochs"])):
             indices = torch.randperm(batch_size, device=device)
             for start in range(0, batch_size, minibatch_size):
@@ -213,6 +254,8 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
                 policy_loss_value = float(policy_loss.detach().cpu().item())
                 value_loss_value = float(value_loss.detach().cpu().item())
                 entropy_value = float(entropy.detach().cpu().item())
+        if profile_update:
+            optimize_seconds = _sync_perf_counter(device) - optimize_start
 
         metrics = {
             "update": update,
@@ -222,19 +265,22 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
             "policy_loss": policy_loss_value,
             "value_loss": value_loss_value,
             "entropy": entropy_value,
-            "episodes_completed": len(episode_coverages),
-            "mean_recent_final_coverage": (
-                sum(episode_coverages[-100:]) / max(1, len(episode_coverages[-100:]))
-            ),
-            "mean_recent_episode_return": (
-                sum(episode_returns[-100:]) / max(1, len(episode_returns[-100:]))
-            ),
-            "mean_recent_episode_length": (
-                sum(episode_lengths[-100:]) / max(1, len(episode_lengths[-100:]))
-            ),
+            "episodes_completed": episode_count,
+            "mean_completed_final_coverage": episode_coverage_sum / max(1, episode_count),
+            "mean_completed_episode_return": episode_return_sum / max(1, episode_count),
+            "mean_completed_episode_length": episode_length_sum / max(1, episode_count),
+            "mean_recent_final_coverage": recent_coverage,
+            "mean_recent_episode_return": recent_return,
+            "mean_recent_episode_length": recent_length,
         }
+        if profile_update:
+            metrics["rollout_seconds"] = rollout_seconds
+            metrics["gae_seconds"] = gae_seconds
+            metrics["optimize_seconds"] = optimize_seconds
 
         if update % int(config["eval_interval"]) == 0 or update == int(config["total_updates"]):
+            if profile_update:
+                eval_start = _sync_perf_counter(device)
             evaluation = evaluate_policy(
                 model,
                 board_size=int(config["board_size"]),
@@ -242,6 +288,7 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
                 episodes=int(config["eval_episodes"]),
                 seed=int(config["seed"]) + 10_000,
                 device=device,
+                use_cute_step_core=bool(config.get("use_cute_step_core", False)),
             )
             metrics["eval_mean_final_coverage"] = evaluation["mean_final_coverage"]
             metrics["eval_mean_episode_return"] = evaluation["mean_episode_return"]
@@ -249,6 +296,9 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
                 import json
 
                 json.dump(evaluation, handle, indent=2)
+            if profile_update:
+                eval_seconds = _sync_perf_counter(device) - eval_start
+                metrics["eval_seconds"] = eval_seconds
             if evaluation["mean_final_coverage"] > best_eval:
                 best_eval = evaluation["mean_final_coverage"]
                 torch.save(
@@ -261,8 +311,13 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
             ):
                 success_reached = True
 
+        if profile_update and (bool(config["save_latest"]) or update % int(config["checkpoint_interval"]) == 0):
+            checkpoint_start = _sync_perf_counter(device)
         if bool(config["save_latest"]) or update % int(config["checkpoint_interval"]) == 0:
             torch.save({"model": model.state_dict(), "config": config}, checkpoint_dir / "latest.pt")
+        if profile_update and (bool(config["save_latest"]) or update % int(config["checkpoint_interval"]) == 0):
+            checkpoint_seconds = _sync_perf_counter(device) - checkpoint_start
+            metrics["checkpoint_seconds"] = checkpoint_seconds
         append_jsonl(metrics_path, metrics)
         now = time.perf_counter()
         if (
@@ -292,6 +347,6 @@ def train_ppo(config: dict[str, Any], run_dir: Path, logger: logging.Logger) -> 
     return {
         "run_dir": str(run_dir),
         "best_eval_mean_final_coverage": best_eval,
-        "episodes_completed": len(episode_coverages),
+        "episodes_completed": episode_count,
         "success_reached": success_reached,
     }

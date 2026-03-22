@@ -5,6 +5,8 @@ from typing import Any
 
 import torch
 
+from snake.cute_kernels import HAVE_CUTE, step_core_cuda
+
 
 class TorchSnakeBatchEnv:
     def __init__(
@@ -18,6 +20,7 @@ class TorchSnakeBatchEnv:
         reward_food: float = 1.0,
         reward_death: float = -1.0,
         reward_step: float = -0.01,
+        use_cute_step_core: bool = False,
     ) -> None:
         self.num_envs = num_envs
         self.board_size = board_size
@@ -29,6 +32,7 @@ class TorchSnakeBatchEnv:
         self.reward_food = reward_food
         self.reward_death = reward_death
         self.reward_step = reward_step
+        self.use_fast_cuda = self.device.type == "cuda"
         self.head_codes = torch.tensor([3, 4, 5, 6], dtype=torch.uint8, device=self.device)
         self.offsets = torch.tensor(
             [
@@ -40,9 +44,18 @@ class TorchSnakeBatchEnv:
             dtype=torch.long,
             device=self.device,
         )
+        self.env_indices = torch.arange(num_envs, dtype=torch.long, device=self.device)
+        self.initial_row = self.board_size // 2
+        self.initial_snake = torch.tensor(
+            [self.initial_row * self.board_size + column for column in range(1, 1 + self.initial_length)],
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.initial_slots = torch.arange(self.initial_length, dtype=torch.long, device=self.device)
 
         self.board = torch.zeros((num_envs, self.num_cells), dtype=torch.uint8, device=self.device)
         self.occupancy = torch.zeros((num_envs, self.num_cells), dtype=torch.bool, device=self.device)
+        self.occupancy_i64 = torch.zeros((num_envs, self.num_cells), dtype=torch.int64, device=self.device)
         self.body = torch.zeros((num_envs, self.num_cells), dtype=torch.long, device=self.device)
         self.start = torch.zeros(num_envs, dtype=torch.long, device=self.device)
         self.length = torch.zeros(num_envs, dtype=torch.long, device=self.device)
@@ -54,8 +67,23 @@ class TorchSnakeBatchEnv:
         self.episode_return = torch.zeros(num_envs, dtype=torch.float32, device=self.device)
         self.reset_counts = torch.zeros(num_envs, dtype=torch.long, device=self.device)
         self.rngs = [random.Random(seed + idx * 100_000) for idx in range(num_envs)]
+        self.cuda_generator: torch.Generator | None = None
+        self.cute_step_enabled = bool(use_cute_step_core) and self.use_fast_cuda and HAVE_CUTE
+        self.cute_done = torch.empty(num_envs, dtype=torch.int64, device=self.device)
+        self.cute_actions = torch.empty(num_envs, dtype=torch.long, device=self.device)
+        self.cute_next_pos = torch.empty(num_envs, dtype=torch.long, device=self.device)
+        self.cute_wall = torch.empty(num_envs, dtype=torch.int64, device=self.device)
+        self.cute_growing = torch.empty(num_envs, dtype=torch.int64, device=self.device)
+        self.cute_dead = torch.empty(num_envs, dtype=torch.int64, device=self.device)
+        self.cute_moving = torch.empty(num_envs, dtype=torch.int64, device=self.device)
+        if self.use_fast_cuda:
+            self.cuda_generator = torch.Generator(device=self.device)
+            self.cuda_generator.manual_seed(seed)
 
     def reset(self, mask: torch.Tensor | None = None) -> torch.Tensor:
+        if self.use_fast_cuda:
+            return self._reset_cuda(mask)
+
         if mask is None:
             indices = list(range(self.num_envs))
         else:
@@ -67,6 +95,7 @@ class TorchSnakeBatchEnv:
 
             self.board[index].zero_()
             self.occupancy[index].zero_()
+            self.occupancy_i64[index].zero_()
             self.body[index].zero_()
             self.start[index] = 0
             self.length[index] = self.initial_length
@@ -85,10 +114,49 @@ class TorchSnakeBatchEnv:
             )
             self.body[index, : self.initial_length] = snake
             self.occupancy[index, snake] = True
+            self.occupancy_i64[index, snake] = 1
             self.board[index, snake[:-1]] = 2
             self.board[index, snake[-1]] = self.head_codes[1]
             self.food[index] = self._spawn_food(index)
             self.board[index, self.food[index]] = 1
+        return self.observe()
+
+    def _reset_cuda(self, mask: torch.Tensor | None = None) -> torch.Tensor:
+        if mask is None:
+            indices = self.env_indices
+        else:
+            indices = torch.nonzero(mask.to(self.device), as_tuple=False).flatten()
+        if indices.numel() == 0:
+            return self.observe()
+
+        self.reset_counts[indices] += 1
+        self.board[indices] = 0
+        self.occupancy[indices] = False
+        self.occupancy_i64[indices] = 0
+        self.body[indices] = 0
+        self.start[indices] = 0
+        self.length[indices] = self.initial_length
+        self.heading[indices] = 1
+        self.food[indices] = -1
+        self.done[indices] = False
+        self.episode_step[indices] = 0
+        self.steps_since_food[indices] = 0
+        self.episode_return[indices] = 0.0
+
+        initial_cells = self.initial_snake.unsqueeze(0).expand(indices.numel(), -1)
+        self.body[indices, : self.initial_length] = initial_cells
+        self.occupancy[indices.unsqueeze(1), initial_cells] = True
+        self.occupancy_i64[indices.unsqueeze(1), initial_cells] = 1
+        if self.initial_length > 1:
+            self.board[indices.unsqueeze(1), initial_cells[:, :-1]] = 2
+        self.board[indices, initial_cells[:, -1]] = self.head_codes[1]
+
+        food = self._spawn_food_many(indices)
+        valid = food >= 0
+        self.food[indices] = food
+        if valid.any():
+            valid_indices = indices[valid]
+            self.board[valid_indices, food[valid]] = 1
         return self.observe()
 
     def observe(self) -> torch.Tensor:
@@ -128,30 +196,75 @@ class TorchSnakeBatchEnv:
         old_length = self.length.clone()
         head_slot = (old_start + old_length - 1) % self.num_cells
         tail_slot = old_start
-        env_indices = torch.arange(self.num_envs, device=self.device)
-        head_pos = self.body[env_indices, head_slot]
-        tail_pos = self.body[env_indices, tail_slot]
+        head_pos = self.body[self.env_indices, head_slot]
+        tail_pos = self.body[self.env_indices, tail_slot]
 
-        head_row = torch.div(head_pos, self.board_size, rounding_mode="floor")
-        head_col = head_pos % self.board_size
-        next_row = head_row + self.offsets[actions, 0]
-        next_col = head_col + self.offsets[actions, 1]
-        wall = (
-            (next_row < 0)
-            | (next_row >= self.board_size)
-            | (next_col < 0)
-            | (next_col >= self.board_size)
-        ) & active
-        safe_next_row = next_row.clamp(0, self.board_size - 1)
-        safe_next_col = next_col.clamp(0, self.board_size - 1)
-        next_pos = safe_next_row * self.board_size + safe_next_col
-
-        growing = (next_pos == self.food) & active & ~wall
-        occupied_next = self.occupancy[env_indices, next_pos] & active & ~wall
-        legal_tail = (next_pos == tail_pos) & ~growing
-        self_hit = occupied_next & ~legal_tail
-        dead = wall | self_hit
-        moving = active & ~dead
+        if self.cute_step_enabled:
+            try:
+                self.cute_done.copy_(self.done.to(torch.int64))
+                step_core_cuda(
+                    actions=actions,
+                    heading=self.heading,
+                    head_pos=head_pos,
+                    tail_pos=tail_pos,
+                    food=self.food,
+                    done=self.cute_done,
+                    occupancy=self.occupancy_i64,
+                    board_size=self.board_size,
+                    sanitized_actions=self.cute_actions,
+                    next_pos=self.cute_next_pos,
+                    wall=self.cute_wall,
+                    growing=self.cute_growing,
+                    dead=self.cute_dead,
+                    moving=self.cute_moving,
+                )
+                actions = self.cute_actions
+                next_pos = self.cute_next_pos
+                wall = self.cute_wall.to(torch.bool)
+                growing = self.cute_growing.to(torch.bool)
+                dead = self.cute_dead.to(torch.bool)
+                moving = self.cute_moving.to(torch.bool)
+            except Exception:
+                self.cute_step_enabled = False
+                head_row = torch.div(head_pos, self.board_size, rounding_mode="floor")
+                head_col = head_pos % self.board_size
+                next_row = head_row + self.offsets[actions, 0]
+                next_col = head_col + self.offsets[actions, 1]
+                wall = (
+                    (next_row < 0)
+                    | (next_row >= self.board_size)
+                    | (next_col < 0)
+                    | (next_col >= self.board_size)
+                ) & active
+                safe_next_row = next_row.clamp(0, self.board_size - 1)
+                safe_next_col = next_col.clamp(0, self.board_size - 1)
+                next_pos = safe_next_row * self.board_size + safe_next_col
+                growing = (next_pos == self.food) & active & ~wall
+                occupied_next = self.occupancy[self.env_indices, next_pos] & active & ~wall
+                legal_tail = (next_pos == tail_pos) & ~growing
+                self_hit = occupied_next & ~legal_tail
+                dead = wall | self_hit
+                moving = active & ~dead
+        else:
+            head_row = torch.div(head_pos, self.board_size, rounding_mode="floor")
+            head_col = head_pos % self.board_size
+            next_row = head_row + self.offsets[actions, 0]
+            next_col = head_col + self.offsets[actions, 1]
+            wall = (
+                (next_row < 0)
+                | (next_row >= self.board_size)
+                | (next_col < 0)
+                | (next_col >= self.board_size)
+            ) & active
+            safe_next_row = next_row.clamp(0, self.board_size - 1)
+            safe_next_col = next_col.clamp(0, self.board_size - 1)
+            next_pos = safe_next_row * self.board_size + safe_next_col
+            growing = (next_pos == self.food) & active & ~wall
+            occupied_next = self.occupancy[self.env_indices, next_pos] & active & ~wall
+            legal_tail = (next_pos == tail_pos) & ~growing
+            self_hit = occupied_next & ~legal_tail
+            dead = wall | self_hit
+            moving = active & ~dead
         non_growing = moving & ~growing
 
         rewards = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
@@ -161,16 +274,17 @@ class TorchSnakeBatchEnv:
         self.episode_step[active] += 1
         self.heading[moving] = actions[moving]
 
-        if torch.any(non_growing):
-            ng_indices = torch.nonzero(non_growing, as_tuple=False).flatten()
+        ng_indices = torch.nonzero(non_growing, as_tuple=False).flatten()
+        if ng_indices.numel() > 0:
             ng_tail = tail_pos[ng_indices]
             self.occupancy[ng_indices, ng_tail] = False
+            self.occupancy_i64[ng_indices, ng_tail] = 0
             self.board[ng_indices, ng_tail] = 0
             self.start[ng_indices] = (self.start[ng_indices] + 1) % self.num_cells
             self.steps_since_food[ng_indices] += 1
 
-        if torch.any(moving):
-            mv_indices = torch.nonzero(moving, as_tuple=False).flatten()
+        mv_indices = torch.nonzero(moving, as_tuple=False).flatten()
+        if mv_indices.numel() > 0:
             old_heads = head_pos[mv_indices]
             self.board[mv_indices, old_heads] = 2
 
@@ -178,23 +292,30 @@ class TorchSnakeBatchEnv:
             new_head = next_pos[mv_indices]
             self.body[mv_indices, new_slot] = new_head
             self.occupancy[mv_indices, new_head] = True
+            self.occupancy_i64[mv_indices, new_head] = 1
             self.board[mv_indices, new_head] = self.head_codes[self.heading[mv_indices]]
 
-        if torch.any(growing):
-            grow_indices = torch.nonzero(growing, as_tuple=False).flatten()
+        grow_indices = torch.nonzero(growing, as_tuple=False).flatten()
+        if grow_indices.numel() > 0:
             self.length[grow_indices] += 1
             self.steps_since_food[grow_indices] = 0
             rewards[grow_indices] += self.reward_food
-            for index in grow_indices.tolist():
-                if int(self.length[index].item()) == self.num_cells:
-                    self.food[index] = -1
-                    continue
-                old_food = int(next_pos[index].item())
-                if old_food >= 0:
-                    self.board[index, old_food] = self.head_codes[int(self.heading[index].item())]
-                new_food = self._spawn_food(index)
-                self.food[index] = new_food
-                self.board[index, new_food] = 1
+            self.food[grow_indices] = -1
+            still_running = grow_indices[self.length[grow_indices] < self.num_cells]
+            if still_running.numel() > 0:
+                if self.use_fast_cuda:
+                    new_food = self._spawn_food_many(still_running)
+                    valid = new_food >= 0
+                    self.food[still_running] = new_food
+                    if valid.any():
+                        valid_indices = still_running[valid]
+                        self.board[valid_indices, new_food[valid]] = 1
+                else:
+                    for index in still_running.tolist():
+                        new_food = self._spawn_food(index)
+                        self.food[index] = new_food
+                        if new_food >= 0:
+                            self.board[index, new_food] = 1
 
         won = moving & (self.length == self.num_cells)
         truncated = moving & ~growing & (self.steps_since_food >= self.max_steps_since_food)
@@ -217,3 +338,20 @@ class TorchSnakeBatchEnv:
         if not empty:
             return -1
         return self.rngs[index].choice(empty)
+
+    def _spawn_food_many(self, indices: torch.Tensor) -> torch.Tensor:
+        if indices.numel() == 0:
+            return torch.empty(0, dtype=torch.long, device=self.device)
+        empty = ~self.occupancy[indices]
+        has_empty = empty.any(dim=1)
+        if self.cuda_generator is not None:
+            scores = torch.rand(
+                (indices.numel(), self.num_cells),
+                device=self.device,
+                generator=self.cuda_generator,
+            )
+        else:
+            scores = torch.rand((indices.numel(), self.num_cells), device=self.device)
+        scores.masked_fill_(~empty, -1.0)
+        food = scores.argmax(dim=1)
+        return torch.where(has_empty, food, torch.full_like(food, -1))

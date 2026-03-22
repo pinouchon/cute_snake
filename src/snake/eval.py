@@ -15,6 +15,7 @@ def evaluate_policy(
     episodes: int,
     seed: int,
     device: torch.device,
+    use_cute_step_core: bool = False,
 ) -> dict[str, Any]:
     model.eval()
     env = TorchSnakeBatchEnv(
@@ -27,6 +28,7 @@ def evaluate_policy(
         reward_food=1.0,
         reward_death=-1.0,
         reward_step=-0.01,
+        use_cute_step_core=use_cute_step_core,
     )
     obs = env.reset()
     finished = torch.zeros(episodes, dtype=torch.bool, device=device)
@@ -42,11 +44,10 @@ def evaluate_policy(
             action = torch.argmax(masked_logits, dim=-1)
         obs, _, dones, info = env.step(action)
         just_finished = dones & ~finished
-        if torch.any(just_finished):
-            final_coverages[just_finished] = info["final_coverage"][just_finished]
-            final_returns[just_finished] = info["episode_return"][just_finished]
-            wins[just_finished] = info["won"][just_finished].to(torch.int32)
-            finished |= just_finished
+        final_coverages[just_finished] = info["final_coverage"][just_finished]
+        final_returns[just_finished] = info["episode_return"][just_finished]
+        wins[just_finished] = info["won"][just_finished].to(torch.int32)
+        finished |= just_finished
 
     return {
         "mean_final_coverage": float(final_coverages.mean().item()),

@@ -3,8 +3,8 @@ seed: 106
 device: cuda
 run_root: runs
 eval_episodes: 5
-eval_interval: 20
-checkpoint_interval: 20
+eval_interval: 10
+checkpoint_interval: 10
 success_target: 0.80
 stop_on_success: true
 
@@ -13,6 +13,7 @@ env:
   initial_length: 3
   food_count: 1
   starvation_steps: 128
+  use_cute_step_core: true
   reward_food: 1.0
   reward_death: -1.0
   reward_step: -0.01
@@ -36,9 +37,10 @@ ppo:
   total_updates: 160
 
 runtime:
-  amp: false
+  amp: true
   console_log_interval_seconds: 10
-  save_latest: true
+  profile_interval_updates: 0
+  save_latest: false
 
 logging:
   metrics_file: metrics.jsonl
