@@ -1,0 +1,49 @@
+project: cute-snake
+seed: 106
+device: cuda
+run_root: runs
+eval_episodes: 5
+eval_interval: 20
+checkpoint_interval: 20
+success_target: 0.80
+stop_on_success: true
+
+env:
+  board_size: 8
+  initial_length: 3
+  food_count: 1
+  starvation_steps: 128
+  reward_food: 1.0
+  reward_death: -1.0
+  reward_step: -0.01
+
+model:
+  trunk_channels: [32, 64]
+  hidden_dim: 256
+
+ppo:
+  num_envs: 2048
+  rollout_len: 32
+  minibatches: 8
+  update_epochs: 4
+  gamma: 0.995
+  gae_lambda: 0.98
+  clip_coef: 0.2
+  value_coef: 0.5
+  entropy_coef: 0.005
+  lr: 1.0e-3
+  max_grad_norm: 0.5
+  total_updates: 160
+
+runtime:
+  amp: false
+  console_log_interval_seconds: 10
+  save_latest: true
+
+logging:
+  metrics_file: metrics.jsonl
+  eval_file: eval.json
+  train_log: train.log
+  checkpoint_dir: checkpoints
+  visualization_dir: visualizations
+  profiler_dir: profiler

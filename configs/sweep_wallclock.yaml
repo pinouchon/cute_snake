@@ -1,0 +1,16 @@
+base: configs/base.yaml
+
+sweep:
+  seed: [0, 1, 2]
+  num_envs: [16384, 32768, 65536]
+  rollout_len: [16, 32, 64]
+  minibatches: [4, 8]
+  lr: [1.0e-4, 3.0e-4, 1.0e-3]
+  entropy_coef: [0.0, 0.01, 0.02]
+  gae_lambda: [0.95, 0.97]
+
+selection_metric: mean_final_coverage
+selection_target: 0.80
+selection_eval_episodes: 5
+objective: time_to_target
+
