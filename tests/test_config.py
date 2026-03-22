@@ -21,8 +21,6 @@ def test_normalize_config_includes_dg_defaults() -> None:
     assert config["dg_detach_gate"] is True
     assert config["dg_gate_floor"] == 0.0
     assert config["dg_log_metrics"] is True
-
-
 def test_dg_gate_uses_raw_advantage_when_enabled() -> None:
     new_logprobs = torch.tensor([-2.0, -0.5], dtype=torch.float32)
     raw_advantages = torch.tensor([2.0, -2.0], dtype=torch.float32)
