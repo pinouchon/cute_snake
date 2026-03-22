@@ -3,11 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-import sys
 
 import torch
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from snake.config import load_yaml_config
 from snake.eval import evaluate_policy

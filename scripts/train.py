@@ -3,9 +3,6 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
-import sys
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from snake.config import apply_overrides, load_yaml_config, normalize_config, save_yaml_config
 from snake.ppo import train_ppo
