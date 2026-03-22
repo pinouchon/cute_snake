@@ -2,6 +2,19 @@
 
 Minimal scaffold for a GPU-first Snake PPO prototype using CuTe DSL, `uv`, and `just`.
 
+## Target
+
+The optimization target for this project is:
+
+- Reach `>80%` mean final coverage over the evaluation episodes.
+- Minimize wall-clock time to reach that target.
+- Observation space, and reward space must stay fixed.
+
+Wall-clock scoring uses this startup rule:
+
+- An initial load/compile step of up to `20s` is tolerated and is not counted toward the run wall clock.
+- If the initial load/compile step exceeds `20s`, the run is considered failed.
+
 ## Setup
 
 ```bash

@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--runs-root", default="runs")
+    parser.add_argument("--timeout-seconds", type=float, default=0.0)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -156,7 +158,24 @@ def main() -> None:
     exit_codes: list[int] = []
     for record in launched:
         proc = record["process"]
-        exit_code = proc.wait()
+        timeout_seconds = float(args.timeout_seconds)
+        if timeout_seconds > 0.0:
+            deadline = time.time() + timeout_seconds
+            exit_code: int | None = None
+            while exit_code is None and time.time() < deadline:
+                exit_code = proc.poll()
+                if exit_code is None:
+                    time.sleep(0.2)
+            if exit_code is None:
+                proc.terminate()
+                try:
+                    exit_code = proc.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    exit_code = proc.wait()
+                print(f"timed_out run={record['run_dir']} gpu={record['gpu']} exit_code={exit_code}")
+        else:
+            exit_code = proc.wait()
         exit_codes.append(exit_code)
         relay = record["relay"]
         relay.join(timeout=1.0)

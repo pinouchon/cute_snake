@@ -42,6 +42,30 @@ def _compute_gae(
     return advantages, returns
 
 
+def _compute_gae_into(
+    *,
+    advantages: torch.Tensor,
+    returns: torch.Tensor,
+    rewards: torch.Tensor,
+    dones: torch.Tensor,
+    values: torch.Tensor,
+    next_value: torch.Tensor,
+    gamma: float,
+    gae_lambda: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    last_advantage = torch.zeros(rewards.shape[1], dtype=torch.float32, device=rewards.device)
+    next_values = next_value
+    for step in reversed(range(rewards.shape[0])):
+        non_terminal = 1.0 - dones[step]
+        delta = rewards[step] + gamma * next_values * non_terminal - values[step]
+        last_advantage = delta + gamma * gae_lambda * non_terminal * last_advantage
+        advantages[step].copy_(last_advantage)
+        next_values = values[step]
+    returns.copy_(advantages)
+    returns.add_(values)
+    return advantages, returns
+
+
 def _sync_perf_counter(device: torch.device) -> float:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -71,7 +95,7 @@ def _evaluate_policy_cached(
     final_returns = torch.zeros(episodes, dtype=torch.float32, device=device)
     wins = torch.zeros(episodes, dtype=torch.int32, device=device)
 
-    with torch.inference_mode():
+    with torch.no_grad():
         while not torch.all(finished):
             mask = eval_env.action_mask()
             logits, _ = model(obs)

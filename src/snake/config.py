@@ -76,6 +76,28 @@ def normalize_config(config: dict[str, Any]) -> dict[str, Any]:
         "reward_step": float(config.get("reward_step", env.get("reward_step", -0.01))),
         "use_cute_step_core": bool(config.get("use_cute_step_core", env.get("use_cute_step_core", False))),
         "compile_model": bool(config.get("compile_model", model.get("compile_model", runtime.get("compile_model", False)))),
+        "compile_mode": str(config.get("compile_mode", model.get("compile_mode", runtime.get("compile_mode", "reduce-overhead")))),
+        "compile_gae": bool(config.get("compile_gae", runtime.get("compile_gae", False))),
+        "compile_disable_cudagraphs": bool(
+            config.get(
+                "compile_disable_cudagraphs",
+                model.get("compile_disable_cudagraphs", runtime.get("compile_disable_cudagraphs", False)),
+            )
+        ),
+        "graph_learner": bool(config.get("graph_learner", runtime.get("graph_learner", False))),
+        "graph_whole_learner": bool(config.get("graph_whole_learner", runtime.get("graph_whole_learner", False))),
+        "graph_gae_pack": bool(config.get("graph_gae_pack", runtime.get("graph_gae_pack", False))),
+        "graph_warmup_updates": int(config.get("graph_warmup_updates", runtime.get("graph_warmup_updates", 3))),
+        "graph_disable_grad_scaler": bool(
+            config.get("graph_disable_grad_scaler", runtime.get("graph_disable_grad_scaler", True))
+        ),
+        "graph_disable_grad_clip": bool(
+            config.get("graph_disable_grad_clip", runtime.get("graph_disable_grad_clip", False))
+        ),
+        "permutation_bank_size": int(config.get("permutation_bank_size", runtime.get("permutation_bank_size", 1))),
+        "static_minibatch_buffers": bool(
+            config.get("static_minibatch_buffers", runtime.get("static_minibatch_buffers", True))
+        ),
         "matmul_precision": config.get("matmul_precision", runtime.get("matmul_precision", "high")),
         "allow_tf32": bool(config.get("allow_tf32", runtime.get("allow_tf32", True))),
         "cudnn_benchmark": bool(config.get("cudnn_benchmark", runtime.get("cudnn_benchmark", True))),
@@ -112,6 +134,7 @@ def normalize_config(config: dict[str, Any]) -> dict[str, Any]:
         "n_step": int(config.get("n_step", dqn.get("n_step", 1))),
         "amp": bool(config.get("amp", runtime.get("amp", True))),
         "console_log_interval_seconds": float(config.get("console_log_interval_seconds", runtime.get("console_log_interval_seconds", 15.0))),
+        "metrics_interval_updates": int(config.get("metrics_interval_updates", runtime.get("metrics_interval_updates", 1))),
         "profile_interval_updates": int(config.get("profile_interval_updates", runtime.get("profile_interval_updates", 10))),
         "save_latest": bool(config.get("save_latest", runtime.get("save_latest", True))),
         "metrics_file": logging.get("metrics_file", "metrics.jsonl"),

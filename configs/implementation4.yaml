@@ -1,11 +1,13 @@
 project: cute-snake
 implementation: implementation4
-seed: 106
+seed: 94
 device: cuda
 run_root: runs
 eval_episodes: 5
 eval_interval: 10
-eval_recent_coverage_gate: 0.66
+eval_after_update: 90
+eval_interval_after: 1
+eval_recent_coverage_gate: 0.65
 checkpoint_interval: 1000
 success_target: 0.80
 stop_on_success: true
@@ -25,7 +27,8 @@ model:
   trunk_channels: [28, 56]
   hidden_dim: 224
   channels_last: true
-  compile_model: false
+  compile_model: true
+  compile_disable_cudagraphs: true
 
 ppo:
   num_envs: 4096
@@ -39,18 +42,27 @@ ppo:
   entropy_coef: 0.005
   use_value_clipping: false
   lr: 2.8e-3
-  max_grad_norm: 0.4
+  max_grad_norm: 0.35
   total_updates: 160
 
 runtime:
   amp: true
-  amp_dtype: float16
+  amp_dtype: bfloat16
   allow_tf32: false
   cudnn_benchmark: false
   console_log_interval_seconds: 10
+  metrics_interval_updates: 10
   profile_interval_updates: 0
   save_latest: false
   matmul_precision: high
+  compile_gae: true
+  graph_learner: true
+  graph_whole_learner: false
+  graph_gae_pack: false
+  graph_warmup_updates: 2
+  graph_disable_grad_clip: true
+  permutation_bank_size: 1
+  static_minibatch_buffers: true
 
 logging:
   metrics_file: metrics.jsonl
