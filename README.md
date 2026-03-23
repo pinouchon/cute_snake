@@ -31,6 +31,7 @@ just test
 just train
 just eval RUN_DIR=runs/0001
 just visualize RUN_DIR=runs/0001
+just sweep N_TRIALS=10
 ```
 
 ## Run Layout
@@ -58,6 +59,26 @@ profiler/
 The `Justfile` includes a `next-run-dir` helper that creates the next directory and the standard subfolders.
 
 The default training config is [configs/implementation4.yaml](/home/vast/cute_snake/configs/implementation4.yaml).
+
+## Optuna Sweeps
+
+The repo includes an Optuna sweep entrypoint in [scripts/sweep_optuna.py](/home/vast/cute_snake/scripts/sweep_optuna.py) and a default search space in [configs/optuna_implementation4.yaml](/home/vast/cute_snake/configs/optuna_implementation4.yaml).
+
+Run a small sweep:
+
+```bash
+uv run python scripts/sweep_optuna.py --config configs/implementation4.yaml --search-config configs/optuna_implementation4.yaml --n-trials 10
+```
+
+Or via `just`:
+
+```bash
+just sweep N_TRIALS=10
+```
+
+By default, Optuna sweeps launch one worker per visible GPU and share the same study storage. On this machine that means `8` parallel workers unless you restrict visibility with `CUDA_VISIBLE_DEVICES` or pass `--gpus`.
+
+Each Optuna trial still creates a normal `runs/####/` directory with the trial config, logs, metrics, and checkpoints. Study state is stored in the SQLite database configured by the search config, by default `optuna/implementation4.db`.
 
 ## Curated Runs
 

@@ -41,3 +41,8 @@ visualize RUN_DIR='':
       [0-9][0-9][0-9][0-9]) run_dir="runs/$$run_dir" ;; \
     esac; \
     uv run python scripts/visualize.py --run-dir "$$run_dir"
+
+sweep N_TRIALS='10' TIMEOUT='':
+    @timeout_arg=""; \
+    if [ -n "${TIMEOUT}" ]; then timeout_arg="--timeout ${TIMEOUT}"; fi; \
+    uv run python scripts/sweep_optuna.py --config configs/implementation4.yaml --search-config configs/optuna_implementation4.yaml --n-trials "${N_TRIALS}" $$timeout_arg

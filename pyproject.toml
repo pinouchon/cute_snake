@@ -9,6 +9,7 @@ description = "GPU-first Snake PPO prototype with a minimal uv-based workflow."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+  "optuna>=4.3",
   "torch>=2.5",
   "pyyaml>=6.0",
 ]

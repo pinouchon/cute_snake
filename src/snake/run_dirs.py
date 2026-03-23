@@ -15,13 +15,18 @@ def allocate_run_dir(root: str | Path = "runs", explicit: str | Path | None = No
     else:
         root_path = Path(root)
         root_path.mkdir(parents=True, exist_ok=True)
-        existing = [
-            int(path.name)
-            for path in root_path.iterdir()
-            if path.is_dir() and path.name.isdigit()
-        ]
-        run_dir = root_path / f"{(max(existing, default=0) + 1):04d}"
-        run_dir.mkdir(parents=True, exist_ok=False)
+        while True:
+            existing = [
+                int(path.name)
+                for path in root_path.iterdir()
+                if path.is_dir() and path.name.isdigit()
+            ]
+            run_dir = root_path / f"{(max(existing, default=0) + 1):04d}"
+            try:
+                run_dir.mkdir(parents=True, exist_ok=False)
+                break
+            except FileExistsError:
+                continue
     for child in ("checkpoints", "visualizations", "profiler"):
         (run_dir / child).mkdir(parents=True, exist_ok=True)
     return run_dir
